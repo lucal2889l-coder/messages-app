@@ -1,0 +1,941 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Messages</title>
+<style>
+  :root{
+    --blue:#0b84ff;
+    --blue-dark:#0066e0;
+    --bg:#ffffff;
+    --sidebar-bg:#f6f6f7;
+    --border:#e2e2e4;
+    --text:#1c1c1e;
+    --text-dim:#8a8a8e;
+    --bubble-in:#e9e9eb;
+    --bubble-in-text:#1c1c1e;
+    --danger:#ff3b30;
+    --radius-bubble:18px;
+  }
+  *{box-sizing:border-box;}
+  html,body{
+    margin:0;height:100%;
+    font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Helvetica,Arial,sans-serif;
+    color:var(--text);
+    background:var(--bg);
+    -webkit-font-smoothing:antialiased;
+  }
+  #app{
+    display:flex;
+    height:100vh;
+    width:100%;
+    overflow:hidden;
+    background:var(--bg);
+    border:1px solid var(--border);
+  }
+
+  /* ---------- Sidebar ---------- */
+  #sidebar{
+    width:300px;
+    min-width:220px;
+    max-width:340px;
+    background:var(--sidebar-bg);
+    border-right:1px solid var(--border);
+    display:flex;
+    flex-direction:column;
+    flex-shrink:0;
+  }
+  #sidebar-header{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    padding:16px 16px 10px 16px;
+  }
+  #sidebar-header h1{
+    font-size:20px;
+    font-weight:700;
+    margin:0;
+    letter-spacing:-0.2px;
+  }
+  #compose-btn{
+    width:30px;height:30px;border-radius:50%;
+    border:none;background:var(--blue);color:#fff;
+    font-size:16px;cursor:pointer;
+    display:flex;align-items:center;justify-content:center;
+    flex-shrink:0;
+  }
+  #compose-btn:hover{background:var(--blue-dark);}
+  #search-wrap{padding:0 12px 10px 12px;}
+  #search-input{
+    width:100%;
+    padding:7px 12px;
+    border-radius:10px;
+    border:none;
+    background:#e5e5e7;
+    font-size:14px;
+    outline:none;
+  }
+  #chat-list{
+    flex:1;
+    overflow-y:auto;
+    padding:4px 8px;
+  }
+  .chat-row{
+    display:flex;
+    align-items:center;
+    gap:10px;
+    padding:8px 8px;
+    border-radius:10px;
+    cursor:pointer;
+    margin-bottom:2px;
+  }
+  .chat-row:hover{background:#eaeaec;}
+  .chat-row.active{background:var(--blue);}
+  .chat-row.active .chat-title{color:#fff;}
+  .chat-row.active .chat-preview{color:#dcebff;}
+  .chat-row.active .chat-time{color:#dcebff;}
+  .avatar{
+    width:40px;height:40px;border-radius:50%;
+    display:flex;align-items:center;justify-content:center;
+    color:#fff;font-weight:600;font-size:15px;
+    flex-shrink:0;
+  }
+  .chat-row-main{flex:1;min-width:0;}
+  .chat-row-top{display:flex;justify-content:space-between;align-items:baseline;gap:6px;}
+  .chat-title{font-size:14.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:flex;align-items:center;gap:4px;}
+  .chat-time{font-size:12px;color:var(--text-dim);flex-shrink:0;}
+  .chat-preview{font-size:13px;color:var(--text-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px;}
+  .lock-icon{flex-shrink:0;opacity:0.7;}
+  #empty-sidebar{
+    padding:40px 20px;text-align:center;color:var(--text-dim);font-size:13.5px;line-height:1.5;
+  }
+
+  /* ---------- Main / conversation ---------- */
+  #main{
+    flex:1;
+    display:flex;
+    flex-direction:column;
+    min-width:0;
+    position:relative;
+  }
+  #conv-header{
+    display:flex;
+    align-items:center;
+    gap:10px;
+    padding:12px 16px;
+    border-bottom:1px solid var(--border);
+    flex-shrink:0;
+  }
+  #back-btn{
+    display:none;
+    border:none;background:none;color:var(--blue);
+    font-size:15px;cursor:pointer;padding:4px 6px 4px 0;
+    flex-shrink:0;
+  }
+  #conv-header .avatar{width:32px;height:32px;font-size:13px;}
+  #conv-title-wrap{flex:1;min-width:0;}
+  #conv-title{font-size:15px;font-weight:600;display:flex;align-items:center;gap:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  #conv-sub{font-size:12px;color:var(--text-dim);}
+  #info-btn{
+    border:none;background:none;color:var(--blue);
+    font-size:20px;cursor:pointer;padding:2px 6px;
+    flex-shrink:0;
+  }
+  #messages-scroll{
+    flex:1;
+    overflow-y:auto;
+    padding:16px 16px 8px 16px;
+    display:flex;
+    flex-direction:column;
+  }
+  .msg-row{display:flex;margin-bottom:4px;}
+  .msg-row.me{justify-content:flex-end;}
+  .msg-row.them{justify-content:flex-start;}
+  .bubble{
+    max-width:62%;
+    padding:8px 14px;
+    border-radius:var(--radius-bubble);
+    font-size:14.5px;
+    line-height:1.35;
+    word-wrap:break-word;
+    white-space:pre-wrap;
+  }
+  .msg-row.me .bubble{background:var(--blue);color:#fff;border-bottom-right-radius:5px;}
+  .msg-row.them .bubble{background:var(--bubble-in);color:var(--bubble-in-text);border-bottom-left-radius:5px;}
+  .msg-meta{font-size:11px;color:var(--text-dim);text-align:center;margin:12px 0 6px 0;}
+  .sender-label{font-size:11.5px;color:var(--text-dim);margin:2px 12px 2px 2px;}
+  #composer{
+    display:flex;
+    align-items:flex-end;
+    gap:8px;
+    padding:10px 14px 14px 14px;
+    border-top:1px solid var(--border);
+    flex-shrink:0;
+  }
+  #msg-input{
+    flex:1;
+    border:1px solid #d5d5d7;
+    border-radius:18px;
+    padding:8px 14px;
+    font-size:14.5px;
+    resize:none;
+    max-height:120px;
+    outline:none;
+    font-family:inherit;
+    line-height:1.35;
+  }
+  #msg-input:focus{border-color:var(--blue);}
+  #send-btn{
+    width:32px;height:32px;border-radius:50%;
+    border:none;background:var(--blue);color:#fff;
+    font-size:15px;cursor:pointer;flex-shrink:0;
+    display:flex;align-items:center;justify-content:center;
+  }
+  #send-btn:disabled{background:#c7c7c9;cursor:default;}
+
+  #no-chat-selected{
+    flex:1;display:flex;align-items:center;justify-content:center;
+    color:var(--text-dim);font-size:14px;text-align:center;flex-direction:column;gap:10px;
+  }
+  #no-chat-selected .big-icon{font-size:40px;opacity:0.5;}
+
+  /* ---------- Modal / overlay ---------- */
+  .overlay{
+    position:absolute;inset:0;
+    background:rgba(0,0,0,0.28);
+    display:flex;align-items:center;justify-content:center;
+    z-index:50;
+  }
+  .modal{
+    background:#fff;border-radius:14px;
+    width:320px;max-width:90%;
+    padding:20px;
+    box-shadow:0 10px 40px rgba(0,0,0,0.2);
+  }
+  .modal h2{margin:0 0 14px 0;font-size:16px;font-weight:700;}
+  .field-label{font-size:12.5px;color:var(--text-dim);margin:10px 0 4px 0;font-weight:500;}
+  .field-input{
+    width:100%;padding:8px 10px;border-radius:8px;
+    border:1px solid #d5d5d7;font-size:14px;outline:none;font-family:inherit;
+  }
+  .field-input:focus{border-color:var(--blue);}
+  .checkbox-row{display:flex;align-items:center;gap:8px;margin-top:14px;font-size:13.5px;}
+  .modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px;}
+  .btn{
+    border:none;border-radius:8px;padding:7px 14px;font-size:14px;cursor:pointer;font-weight:500;
+  }
+  .btn-primary{background:var(--blue);color:#fff;}
+  .btn-primary:disabled{background:#c7c7c9;cursor:default;}
+  .btn-secondary{background:#efeff0;color:var(--text);}
+  .btn-danger{background:var(--danger);color:#fff;}
+  .error-text{color:var(--danger);font-size:12.5px;margin-top:8px;min-height:14px;}
+  .lock-big{font-size:30px;text-align:center;margin-bottom:4px;}
+  .subtle-note{font-size:12px;color:var(--text-dim);margin-top:10px;line-height:1.4;}
+
+  /* Info panel */
+  #info-panel{
+    position:absolute;top:0;right:0;bottom:0;
+    width:280px;max-width:80%;
+    background:#fff;border-left:1px solid var(--border);
+    box-shadow:-6px 0 24px rgba(0,0,0,0.08);
+    display:flex;flex-direction:column;
+    z-index:40;
+    transform:translateX(0);
+  }
+  #info-panel-header{
+    display:flex;align-items:center;justify-content:space-between;
+    padding:14px 16px;border-bottom:1px solid var(--border);
+  }
+  #info-panel-header h3{margin:0;font-size:15px;}
+  #info-panel-close{border:none;background:none;font-size:15px;color:var(--blue);cursor:pointer;}
+  #info-panel-body{padding:16px;overflow-y:auto;flex:1;}
+
+  @media (max-width:680px){
+    #sidebar{
+      width:100%;max-width:none;
+      position:absolute;inset:0;z-index:5;
+    }
+    #sidebar.hidden{display:none;}
+    #main.hidden{display:none;}
+    #back-btn{display:inline-block;}
+    #app{border:none;}
+    .bubble{max-width:78%;}
+  }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <div id="sidebar">
+    <div id="sidebar-header">
+      <h1>Messages</h1>
+      <button id="compose-btn" title="New chat">✎</button>
+    </div>
+    <div id="search-wrap">
+      <input id="search-input" type="text" placeholder="Search">
+    </div>
+    <div id="chat-list"></div>
+  </div>
+
+  <div id="main">
+    <div id="no-chat-selected">
+      <div class="big-icon">💬</div>
+      <div>Select a chat, or start a new one.</div>
+    </div>
+
+    <div id="conv-header" style="display:none;">
+      <button id="back-btn">‹ Back</button>
+      <div class="avatar" id="conv-avatar"></div>
+      <div id="conv-title-wrap">
+        <div id="conv-title"></div>
+        <div id="conv-sub"></div>
+      </div>
+      <button id="info-btn" title="Chat info">ⓘ</button>
+    </div>
+
+    <div id="messages-scroll" style="display:none;"></div>
+
+    <div id="composer" style="display:none;">
+      <textarea id="msg-input" rows="1" placeholder="iMessage"></textarea>
+      <button id="send-btn">↑</button>
+    </div>
+
+    <div id="info-panel" style="display:none;"></div>
+  </div>
+
+</div>
+
+<div id="modal-root"></div>
+
+<script>
+(function(){
+
+  // ---------------- Storage ----------------
+  // Private profile data stays in this browser.
+  // Shared chats/messages are stored on the Render server.
+  const API_BASE = '/api/data/';
+
+  const privateStorage = {
+    async get(key){
+      const raw = localStorage.getItem(key);
+      if(raw === null) throw new Error('key not found');
+      return {key, value: raw, shared:false};
+    },
+    async set(key, value){
+      localStorage.setItem(key, value);
+      return {key, value, shared:false};
+    },
+    async delete(key){
+      localStorage.removeItem(key);
+      return {key, deleted:true, shared:false};
+    }
+  };
+
+  async function serverGet(key){
+    const res = await fetch(API_BASE + encodeURIComponent(key));
+    if(res.status === 404) throw new Error('key not found');
+    if(!res.ok) throw new Error('server read failed');
+    const data = await res.json();
+    return {key, value: JSON.stringify(data.value), shared:true};
+  }
+
+  async function serverSet(key, value){
+    const res = await fetch(API_BASE + encodeURIComponent(key), {
+      method:'PUT',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({value: JSON.parse(value)})
+    });
+    if(!res.ok) throw new Error('server write failed');
+    const data = await res.json();
+    return {key, value: JSON.stringify(data.value), shared:true};
+  }
+
+  async function storageGet(key, shared){
+    return shared ? serverGet(key) : privateStorage.get(key);
+  }
+
+  async function storageSet(key, value, shared){
+    return shared ? serverSet(key, value) : privateStorage.set(key, value);
+  }
+
+  async function storageDelete(key, shared){
+    if(shared){
+      const res = await fetch(API_BASE + encodeURIComponent(key), {method:'DELETE'});
+      if(!res.ok && res.status !== 404) throw new Error('server delete failed');
+      return {key, deleted:true, shared:true};
+    }
+    return privateStorage.delete(key);
+  }
+
+  async function getData(key, shared, fallback){
+    try{
+      const res = await storageGet(key, shared);
+      return res ? JSON.parse(res.value) : fallback;
+    }catch(e){
+      return fallback;
+    }
+  }
+
+  async function getDataOrKeep(key, shared){
+    try{
+      const res = await storageGet(key, shared);
+      return {changed:true, value: res ? JSON.parse(res.value) : []};
+    }catch(e){
+      return {changed:false};
+    }
+  }
+
+  async function setData(key, value, shared){
+    try{
+      await storageSet(key, JSON.stringify(value), shared);
+      return true;
+    }catch(e){
+      console.error('storage set failed', key, e);
+      return false;
+    }
+  }
+
+  function genId(){
+    if(window.crypto && crypto.randomUUID) return crypto.randomUUID();
+    return 'id-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  }
+
+  async function hashPassword(pw){
+    try{
+      const enc = new TextEncoder().encode(pw);
+      const buf = await crypto.subtle.digest('SHA-256', enc);
+      return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
+    }catch(e){
+      // fallback simple hash if subtlecrypto unavailable
+      let h = 0;
+      for(let i=0;i<pw.length;i++){ h = ((h<<5)-h+pw.charCodeAt(i))|0; }
+      return 'fb'+h;
+    }
+  }
+
+  // ---------------- App state ----------------
+  const state = {
+    profile: null,          // {id, name}
+    chats: [],               // array of chat objects
+    currentChatId: null,
+    unlockedChatIds: new Set(), // session-only
+    messagesCache: {},       // chatId -> array of messages
+    searchTerm: ''
+  };
+
+  const AVATAR_COLORS = ['#ff9500','#ff3b30','#af52de','#5856d6','#007aff','#34c759','#ff2d55','#5ac8fa','#ffcc00'];
+  function colorForName(name){
+    let h=0;
+    for(let i=0;i<name.length;i++) h = (h*31 + name.charCodeAt(i)) >>> 0;
+    return AVATAR_COLORS[h % AVATAR_COLORS.length];
+  }
+  function initialsForName(name){
+    const parts = name.trim().split(/\s+/).filter(Boolean);
+    if(parts.length===0) return '?';
+    if(parts.length===1) return parts[0].slice(0,2).toUpperCase();
+    return (parts[0][0]+parts[1][0]).toUpperCase();
+  }
+
+  function escapeHtml(str){
+    const d = document.createElement('div');
+    d.innerText = str;
+    return d.innerHTML;
+  }
+
+  function fmtTime(ts){
+    const d = new Date(ts);
+    const now = new Date();
+    const sameDay = d.toDateString() === now.toDateString();
+    if(sameDay) return d.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'});
+    const oneWeek = 6*24*60*60*1000;
+    if(now - d < oneWeek) return d.toLocaleDateString([], {weekday:'short'});
+    return d.toLocaleDateString([], {month:'short', day:'numeric'});
+  }
+
+  // ---------------- Modal system ----------------
+  const modalRoot = document.getElementById('modal-root');
+  function closeModal(){ modalRoot.innerHTML = ''; }
+  function openModal(html){ modalRoot.innerHTML = '<div class="overlay" id="active-overlay">'+html+'</div>'; }
+
+  // ---------------- Name onboarding ----------------
+  function showNamePrompt(){
+    openModal(`
+      <div class="modal">
+        <h2>What should we call you?</h2>
+        <input id="name-input" class="field-input" type="text" placeholder="Your name" maxlength="30" autofocus>
+        <div class="error-text" id="name-error"></div>
+        <div class="modal-actions">
+          <button class="btn btn-primary" id="name-save-btn">Continue</button>
+        </div>
+      </div>
+    `);
+    const input = document.getElementById('name-input');
+    input.focus();
+    const save = async ()=>{
+      const name = input.value.trim();
+      if(!name){ document.getElementById('name-error').textContent = 'Please enter a name.'; return; }
+      const profile = {id: genId(), name};
+      await setData('profile', profile, false);
+      state.profile = profile;
+      closeModal();
+      init();
+    };
+    document.getElementById('name-save-btn').onclick = save;
+    input.addEventListener('keydown', e=>{ if(e.key==='Enter') save(); });
+  }
+
+  // ---------------- New chat modal ----------------
+  function showNewChatModal(){
+    openModal(`
+      <div class="modal">
+        <h2>New Chat</h2>
+        <div class="field-label">Chat name</div>
+        <input id="new-chat-title" class="field-input" type="text" placeholder="e.g. Weekend Trip" maxlength="40" autofocus>
+        <div class="checkbox-row">
+          <input type="checkbox" id="new-chat-locked">
+          <label for="new-chat-locked">Lock this chat with a password</label>
+        </div>
+        <div id="new-chat-pw-fields" style="display:none;">
+          <div class="field-label">Password</div>
+          <input id="new-chat-pw" class="field-input" type="password" maxlength="60">
+          <div class="field-label">Confirm password</div>
+          <input id="new-chat-pw2" class="field-input" type="password" maxlength="60">
+        </div>
+        <div class="error-text" id="new-chat-error"></div>
+        <div class="modal-actions">
+          <button class="btn btn-secondary" id="new-chat-cancel">Cancel</button>
+          <button class="btn btn-primary" id="new-chat-create">Create</button>
+        </div>
+      </div>
+    `);
+    const lockedBox = document.getElementById('new-chat-locked');
+    const pwFields = document.getElementById('new-chat-pw-fields');
+    lockedBox.onchange = ()=>{ pwFields.style.display = lockedBox.checked ? 'block' : 'none'; };
+    document.getElementById('new-chat-cancel').onclick = closeModal;
+    document.getElementById('new-chat-title').focus();
+
+    document.getElementById('new-chat-create').onclick = async ()=>{
+      const errEl = document.getElementById('new-chat-error');
+      const title = document.getElementById('new-chat-title').value.trim();
+      if(!title){ errEl.textContent = 'Please give the chat a name.'; return; }
+      let locked = lockedBox.checked;
+      let passwordHash = null;
+      if(locked){
+        const pw = document.getElementById('new-chat-pw').value;
+        const pw2 = document.getElementById('new-chat-pw2').value;
+        if(pw.length < 4){ errEl.textContent = 'Password must be at least 4 characters.'; return; }
+        if(pw !== pw2){ errEl.textContent = 'Passwords do not match.'; return; }
+        passwordHash = await hashPassword(pw);
+      }
+      const chat = {
+        id: genId(),
+        title,
+        locked,
+        passwordHash,
+        createdAt: Date.now(),
+        lastMessageAt: Date.now(),
+        lastMessage: '',
+        lastSenderName: '',
+        lastSenderId: null
+      };
+      // Read the freshest chat list before writing, falling back to our
+      // current in-memory list (never to an empty array) if that read fails.
+      const fresh = await getDataOrKeep('chats', true);
+      const baseChats = fresh.changed ? fresh.value : state.chats;
+      baseChats.unshift(chat);
+      state.chats = baseChats;
+      const ok = await setData('chats', state.chats, true);
+      await setData('messages:'+chat.id, [], true);
+      state.unlockedChatIds.add(chat.id); // creator starts unlocked
+      closeModal();
+      renderChatList();
+      selectChat(chat.id);
+      if(!ok) showToast("Chat created, but couldn't confirm it saved — check your connection.");
+    };
+  }
+
+  // ---------------- Password prompt (for locked chats) ----------------
+  function showPasswordPrompt(chat, onSuccess){
+    openModal(`
+      <div class="modal">
+        <div class="lock-big">🔒</div>
+        <h2 style="text-align:center;">${escapeHtml(chat.title)}</h2>
+        <div class="field-label">This chat is locked. Enter the password to open it.</div>
+        <input id="unlock-pw" class="field-input" type="password" autofocus>
+        <div class="error-text" id="unlock-error"></div>
+        <div class="modal-actions">
+          <button class="btn btn-secondary" id="unlock-cancel">Cancel</button>
+          <button class="btn btn-primary" id="unlock-submit">Unlock</button>
+        </div>
+      </div>
+    `);
+    const input = document.getElementById('unlock-pw');
+    input.focus();
+    document.getElementById('unlock-cancel').onclick = closeModal;
+    const attempt = async ()=>{
+      const pw = input.value;
+      const h = await hashPassword(pw);
+      if(h === chat.passwordHash){
+        state.unlockedChatIds.add(chat.id);
+        closeModal();
+        onSuccess();
+      }else{
+        document.getElementById('unlock-error').textContent = 'Incorrect password.';
+      }
+    };
+    document.getElementById('unlock-submit').onclick = attempt;
+    input.addEventListener('keydown', e=>{ if(e.key==='Enter') attempt(); });
+  }
+
+  function showDeleteConfirm(chat){
+    openModal(`
+      <div class="modal">
+        <h2>Delete "${escapeHtml(chat.title)}"?</h2>
+        <div class="field-label" style="margin-top:0;">This removes the chat and its messages for everyone. This can't be undone.</div>
+        <div class="modal-actions">
+          <button class="btn btn-secondary" id="del-cancel">Cancel</button>
+          <button class="btn btn-danger" id="del-confirm">Delete</button>
+        </div>
+      </div>
+    `);
+    document.getElementById('del-cancel').onclick = closeModal;
+    document.getElementById('del-confirm').onclick = async ()=>{
+      state.chats = state.chats.filter(c=>c.id!==chat.id);
+      await setData('chats', state.chats, true);
+      if(state.currentChatId === chat.id){
+        state.currentChatId = null;
+        showNoChatSelected();
+      }
+      closeModal();
+      renderChatList();
+    };
+  }
+
+  // ---------------- Rendering: sidebar ----------------
+  function renderChatList(){
+    const list = document.getElementById('chat-list');
+    let chats = state.chats.slice().sort((a,b)=>b.lastMessageAt - a.lastMessageAt);
+    if(state.searchTerm){
+      const q = state.searchTerm.toLowerCase();
+      chats = chats.filter(c=>c.title.toLowerCase().includes(q));
+    }
+    if(chats.length===0){
+      list.innerHTML = '<div id="empty-sidebar">No chats yet.<br>Tap ✎ to start one.</div>';
+      return;
+    }
+    list.innerHTML = chats.map(c=>{
+      const unlocked = !c.locked || state.unlockedChatIds.has(c.id);
+      let previewName = c.lastSenderName;
+      if(state.profile && c.lastSenderId === state.profile.id) previewName = 'You';
+      const preview = c.locked && !unlocked ? 'Locked chat' : (c.lastMessage ? (previewName ? escapeHtml(previewName)+': '+escapeHtml(c.lastMessage) : escapeHtml(c.lastMessage)) : 'No messages yet');
+      const active = c.id === state.currentChatId ? 'active' : '';
+      return `
+        <div class="chat-row ${active}" data-id="${c.id}">
+          <div class="avatar" style="background:${colorForName(c.title)}">${initialsForName(c.title)}</div>
+          <div class="chat-row-main">
+            <div class="chat-row-top">
+              <div class="chat-title">${c.locked ? '<span class="lock-icon">🔒</span>' : ''}${escapeHtml(c.title)}</div>
+              <div class="chat-time">${fmtTime(c.lastMessageAt)}</div>
+            </div>
+            <div class="chat-preview">${preview}</div>
+          </div>
+        </div>
+      `;
+    }).join('');
+    list.querySelectorAll('.chat-row').forEach(row=>{
+      row.onclick = ()=> selectChat(row.getAttribute('data-id'));
+    });
+  }
+
+  // ---------------- Rendering: conversation ----------------
+  function showNoChatSelected(){
+    document.getElementById('no-chat-selected').style.display = 'flex';
+    document.getElementById('conv-header').style.display = 'none';
+    document.getElementById('messages-scroll').style.display = 'none';
+    document.getElementById('composer').style.display = 'none';
+    document.getElementById('info-panel').style.display = 'none';
+  }
+
+  async function selectChat(chatId){
+    const chat = state.chats.find(c=>c.id===chatId);
+    if(!chat) return;
+    if(chat.locked && !state.unlockedChatIds.has(chat.id)){
+      showPasswordPrompt(chat, ()=> openChat(chatId));
+      return;
+    }
+    openChat(chatId);
+  }
+
+  async function openChat(chatId){
+    state.currentChatId = chatId;
+    document.getElementById('info-panel').style.display = 'none';
+    if(window.innerWidth <= 680){
+      document.getElementById('sidebar').classList.add('hidden');
+      document.getElementById('main').classList.remove('hidden');
+    }
+    renderChatList();
+    renderConvHeader();
+    document.getElementById('no-chat-selected').style.display = 'none';
+    document.getElementById('conv-header').style.display = 'flex';
+    document.getElementById('messages-scroll').style.display = 'flex';
+    document.getElementById('composer').style.display = 'flex';
+    await refreshMessages(chatId, true);
+    document.getElementById('msg-input').focus();
+  }
+
+  function renderConvHeader(){
+    const chat = state.chats.find(c=>c.id===state.currentChatId);
+    if(!chat) return;
+    document.getElementById('conv-avatar').style.background = colorForName(chat.title);
+    document.getElementById('conv-avatar').textContent = initialsForName(chat.title);
+    document.getElementById('conv-title').innerHTML = (chat.locked ? '🔒 ' : '') + escapeHtml(chat.title);
+    document.getElementById('conv-sub').textContent = '';
+  }
+
+  function renderMessages(chatId){
+    const el = document.getElementById('messages-scroll');
+    const msgs = state.messagesCache[chatId] || [];
+    const wasNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    let lastDay = null;
+    let html = '';
+    msgs.forEach(m=>{
+      const day = new Date(m.ts).toDateString();
+      if(day !== lastDay){
+        html += `<div class="msg-meta">${new Date(m.ts).toLocaleDateString([], {weekday:'long', month:'short', day:'numeric'})}</div>`;
+        lastDay = day;
+      }
+      const mine = m.senderId === state.profile.id;
+      html += `<div class="msg-row ${mine?'me':'them'}">`;
+      html += `<div>`;
+      if(!mine) html += `<div class="sender-label">${escapeHtml(m.senderName)}</div>`;
+      html += `<div class="bubble">${escapeHtml(m.text)}</div>`;
+      html += `</div></div>`;
+    });
+    el.innerHTML = html || '';
+    if(wasNearBottom){ el.scrollTop = el.scrollHeight; }
+  }
+
+  async function refreshMessages(chatId, forceScroll){
+    const msgs = await getData('messages:'+chatId, true, []);
+    state.messagesCache[chatId] = msgs;
+    if(chatId === state.currentChatId){
+      renderMessages(chatId);
+      if(forceScroll){
+        const el = document.getElementById('messages-scroll');
+        el.scrollTop = el.scrollHeight;
+      }
+    }
+  }
+
+  // ---------------- Sending messages ----------------
+  async function sendMessage(){
+    const input = document.getElementById('msg-input');
+    const text = input.value.trim();
+    if(!text || !state.currentChatId) return;
+    const chatId = state.currentChatId;
+    input.value = '';
+    autosizeInput(input);
+    updateSendBtn();
+
+    // Read the freshest message list, falling back to our own cache
+    // (never to an empty array) if that read fails — otherwise a
+    // transient read error here would wipe the whole conversation.
+    const fresh = await getDataOrKeep('messages:'+chatId, true);
+    const msgs = fresh.changed ? fresh.value : (state.messagesCache[chatId] || []).slice();
+    const msg = {
+      id: genId(),
+      senderId: state.profile.id,
+      senderName: state.profile.name,
+      text,
+      ts: Date.now()
+    };
+    msgs.push(msg);
+    const saved = await setData('messages:'+chatId, msgs, true);
+    state.messagesCache[chatId] = msgs;
+    renderMessages(chatId);
+    const el = document.getElementById('messages-scroll');
+    el.scrollTop = el.scrollHeight;
+    if(!saved) showToast("Message may not have saved — check your connection.");
+
+    // update chat metadata, same safe-fallback pattern
+    const freshChats = await getDataOrKeep('chats', true);
+    const chats = freshChats.changed ? freshChats.value : state.chats;
+    const idx = chats.findIndex(c=>c.id===chatId);
+    if(idx>-1){
+      chats[idx].lastMessage = text;
+      chats[idx].lastSenderName = msg.senderName;
+      chats[idx].lastSenderId = msg.senderId;
+      chats[idx].lastMessageAt = msg.ts;
+      state.chats = chats;
+      await setData('chats', chats, true);
+      renderChatList();
+    }
+  }
+
+  function autosizeInput(input){
+    input.style.height = 'auto';
+    input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+  }
+  function updateSendBtn(){
+    const input = document.getElementById('msg-input');
+    document.getElementById('send-btn').disabled = input.value.trim().length===0;
+  }
+
+  // ---------------- Info panel ----------------
+  function toggleInfoPanel(){
+    const panel = document.getElementById('info-panel');
+    const isOpen = panel.style.display === 'flex';
+    if(isOpen){ panel.style.display = 'none'; return; }
+    renderInfoPanel();
+    panel.style.display = 'flex';
+  }
+
+  function renderInfoPanel(){
+    const chat = state.chats.find(c=>c.id===state.currentChatId);
+    if(!chat) return;
+    const panel = document.getElementById('info-panel');
+    panel.style.flexDirection = 'column';
+    panel.innerHTML = `
+      <div id="info-panel-header">
+        <h3>Chat Info</h3>
+        <button id="info-panel-close">Done</button>
+      </div>
+      <div id="info-panel-body">
+        <div class="field-label">Chat name</div>
+        <input id="info-title" class="field-input" type="text" value="${escapeHtml(chat.title)}" maxlength="40">
+        <div class="checkbox-row">
+          <input type="checkbox" id="info-locked" ${chat.locked?'checked':''}>
+          <label for="info-locked">Lock this chat with a password</label>
+        </div>
+        <div id="info-pw-fields" style="display:none;">
+          <div class="field-label">New password</div>
+          <input id="info-pw" class="field-input" type="password" maxlength="60">
+          <div class="field-label">Confirm password</div>
+          <input id="info-pw2" class="field-input" type="password" maxlength="60">
+        </div>
+        <div class="error-text" id="info-error"></div>
+        <div class="modal-actions" style="justify-content:flex-start;">
+          <button class="btn btn-primary" id="info-save">Save changes</button>
+        </div>
+        <div style="height:1px;background:var(--border);margin:18px 0;"></div>
+        <button class="btn btn-danger" id="info-delete" style="width:100%;">Delete Chat</button>
+        <div class="subtle-note">Passwords lock the chat behind a prompt in this app, but this isn't real encryption — treat it as a privacy convenience, not a secure vault.</div>
+      </div>
+    `;
+    document.getElementById('info-panel-close').onclick = toggleInfoPanel;
+    const lockedBox = document.getElementById('info-locked');
+    const pwFields = document.getElementById('info-pw-fields');
+    // if turning lock ON (from off), need new password
+    lockedBox.onchange = ()=>{
+      pwFields.style.display = (lockedBox.checked && !chat.locked) ? 'block' : 'none';
+    };
+    document.getElementById('info-delete').onclick = ()=> showDeleteConfirm(chat);
+
+    document.getElementById('info-save').onclick = async ()=>{
+      const errEl = document.getElementById('info-error');
+      const newTitle = document.getElementById('info-title').value.trim();
+      if(!newTitle){ errEl.textContent = 'Chat name cannot be empty.'; return; }
+      let newLocked = lockedBox.checked;
+      let newHash = chat.passwordHash;
+      if(newLocked && !chat.locked){
+        const pw = document.getElementById('info-pw').value;
+        const pw2 = document.getElementById('info-pw2').value;
+        if(pw.length < 4){ errEl.textContent = 'Password must be at least 4 characters.'; return; }
+        if(pw !== pw2){ errEl.textContent = 'Passwords do not match.'; return; }
+        newHash = await hashPassword(pw);
+        state.unlockedChatIds.add(chat.id);
+      }
+      if(!newLocked){ newHash = null; }
+      chat.title = newTitle;
+      chat.locked = newLocked;
+      chat.passwordHash = newHash;
+      const fresh = await getDataOrKeep('chats', true);
+      const baseChats = fresh.changed ? fresh.value : state.chats;
+      const idx = baseChats.findIndex(c=>c.id===chat.id);
+      if(idx>-1) baseChats[idx] = chat; else baseChats.unshift(chat);
+      state.chats = baseChats;
+      const ok = await setData('chats', state.chats, true);
+      renderChatList();
+      renderConvHeader();
+      toggleInfoPanel();
+      if(!ok) showToast("Changes saved locally, but couldn't confirm they synced.");
+    };
+  }
+
+  // ---------------- Search ----------------
+  document.getElementById('search-input').addEventListener('input', e=>{
+    state.searchTerm = e.target.value;
+    renderChatList();
+  });
+
+  // ---------------- Composer events ----------------
+  const msgInput = document.getElementById('msg-input');
+  msgInput.addEventListener('input', ()=>{ autosizeInput(msgInput); updateSendBtn(); });
+  msgInput.addEventListener('keydown', e=>{
+    if(e.key==='Enter' && !e.shiftKey){
+      e.preventDefault();
+      sendMessage();
+    }
+  });
+  document.getElementById('send-btn').onclick = sendMessage;
+  document.getElementById('compose-btn').onclick = showNewChatModal;
+  document.getElementById('info-btn').onclick = toggleInfoPanel;
+  document.getElementById('back-btn').onclick = ()=>{
+    document.getElementById('sidebar').classList.remove('hidden');
+    document.getElementById('main').classList.add('hidden');
+  };
+
+  // ---------------- Polling ----------------
+  // Background refresh. Critical rule: a failed read must NEVER overwrite
+  // existing local state with an empty list — that was the bug that made
+  // chats "disappear". We only apply a poll result when the read actually
+  // succeeded.
+  async function pollLoop(){
+    const chatsRes = await getDataOrKeep('chats', true);
+    if(chatsRes.changed){
+      state.chats = chatsRes.value;
+      renderChatList();
+    }
+    if(state.currentChatId){
+      const stillExists = state.chats.find(c=>c.id===state.currentChatId);
+      if(stillExists){
+        const msgsRes = await getDataOrKeep('messages:'+state.currentChatId, true);
+        if(msgsRes.changed){
+          state.messagesCache[state.currentChatId] = msgsRes.value;
+          renderMessages(state.currentChatId);
+        }
+      }else if(chatsRes.changed){
+        // Only treat the chat as genuinely deleted if we successfully
+        // confirmed a fresh chat list that no longer contains it.
+        state.currentChatId = null;
+        showNoChatSelected();
+      }
+    }
+  }
+  setInterval(pollLoop, 3500);
+
+  // ---------------- Init ----------------
+  async function init(){
+    if(!state.profile){
+      const profile = await getData('profile', false, null);
+      if(!profile){
+        showNamePrompt();
+        return;
+      }
+      state.profile = profile;
+    }
+    state.chats = await getData('chats', true, []);
+    renderChatList();
+    updateSendBtn();
+    if(window.innerWidth <= 680){
+      document.getElementById('main').classList.add('hidden');
+    }
+  }
+
+  init();
+
+})();
+</script>
+</body>
+</html>
