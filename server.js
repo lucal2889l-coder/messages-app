@@ -1,62 +1,32 @@
 const express = require('express');
+const fs = require('fs');
 const path = require('path');
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
+// DATA_DIR is unset on Render's free plan (no disk mounted), so this
+// falls back to the app folder — fine for testing, but wiped on every
+// deploy/restart/idle-spindown. Set DATA_DIR=/var/data once a paid
+// plan + disk are attached (see render.yaml).
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+const DATA_FILE = path.join(DATA_DIR, 'data.json');
 
-// JSONBin.io config — set these in your environment (Render dashboard,
-// or $env:JSONBIN_API_KEY / $env:JSONBIN_BIN_ID locally for testing).
-const JSONBIN_API_KEY = process.env.JSONBIN_API_KEY;
-const JSONBIN_BIN_ID = process.env.JSONBIN_BIN_ID;
-const JSONBIN_BASE = 'https://api.jsonbin.io/v3/b';
-const persistenceEnabled = Boolean(JSONBIN_API_KEY && JSONBIN_BIN_ID);
-
-let store = {};
-
-async function loadStore() {
-  if (!persistenceEnabled) {
-    console.warn(
-      'JSONBIN_API_KEY / JSONBIN_BIN_ID not set — running with in-memory ' +
-      'storage only. Data will not persist across restarts.'
-    );
-    return;
-  }
+function loadStore() {
   try {
-    const res = await fetch(`${JSONBIN_BASE}/${JSONBIN_BIN_ID}/latest?meta=false`, {
-      headers: { 'X-Master-Key': JSONBIN_API_KEY }
-    });
-    if (!res.ok) {
-      throw new Error(`${res.status} ${res.statusText}`);
-    }
-    const data = await res.json();
-    store = data && typeof data === 'object' ? data : {};
-    console.log('Loaded store from JSONBin.');
-  } catch (err) {
-    console.error('Could not load store from JSONBin, starting empty:', err.message);
-    store = {};
+    const raw = fs.readFileSync(DATA_FILE, 'utf8');
+    return JSON.parse(raw);
+  } catch (e) {
+    return {};
   }
 }
 
-async function saveStore() {
-  if (!persistenceEnabled) return;
-  try {
-    const res = await fetch(`${JSONBIN_BASE}/${JSONBIN_BIN_ID}`, {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Master-Key': JSONBIN_API_KEY
-      },
-      body: JSON.stringify(store)
-    });
-    if (!res.ok) {
-      throw new Error(`${res.status} ${res.statusText}`);
-    }
-  } catch (err) {
-    console.error('Could not save store to JSONBin:', err.message);
-  }
+function saveStore(store) {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(store, null, 2));
 }
+
+let store = loadStore();
 
 app.get('/api/health', (req, res) => {
   res.json({ ok: true });
@@ -70,19 +40,19 @@ app.get('/api/data/:key', (req, res) => {
   res.json({ key, value: store[key] });
 });
 
-app.put('/api/data/:key', async (req, res) => {
+app.put('/api/data/:key', (req, res) => {
   const key = req.params.key;
   const value = req.body ? req.body.value : undefined;
   store[key] = value;
-  await saveStore();
+  saveStore(store);
   res.json({ key, value });
 });
 
-app.delete('/api/data/:key', async (req, res) => {
+app.delete('/api/data/:key', (req, res) => {
   const key = req.params.key;
   const existed = key in store;
   delete store[key];
-  await saveStore();
+  saveStore(store);
   if (!existed) {
     return res.status(404).json({ error: 'not found' });
   }
@@ -91,12 +61,10 @@ app.delete('/api/data/:key', async (req, res) => {
 
 app.use(express.static(__dirname));
 
-app.use((req, res) => {
+app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-loadStore().then(() => {
-  app.listen(PORT, () => {
-    console.log(`Messages server listening on port ${PORT}`);
-  });
+app.listen(PORT, () => {
+  console.log(`Messages server listening on port ${PORT}`);
 });
