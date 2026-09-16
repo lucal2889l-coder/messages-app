@@ -16,6 +16,8 @@
     --bubble-in:#e9e9eb;
     --bubble-in-text:#1c1c1e;
     --danger:#ff3b30;
+    --warn:#ff9500;
+    --ok:#34c759;
     --radius-bubble:18px;
   }
   *{box-sizing:border-box;}
@@ -52,12 +54,28 @@
     justify-content:space-between;
     padding:16px 16px 10px 16px;
   }
+  #sidebar-header-title{
+    display:flex;
+    align-items:center;
+    gap:8px;
+    min-width:0;
+  }
   #sidebar-header h1{
     font-size:20px;
     font-weight:700;
     margin:0;
     letter-spacing:-0.2px;
   }
+  #conn-dot{
+    width:9px;height:9px;border-radius:50%;
+    background:var(--danger);
+    flex-shrink:0;
+    transition:background-color .25s ease;
+    box-shadow:0 0 0 3px rgba(0,0,0,0.04);
+  }
+  #conn-dot.conn-connecting{background:var(--warn);}
+  #conn-dot.conn-connected{background:var(--ok);}
+  #conn-dot.conn-disconnected{background:var(--danger);}
   #compose-btn{
     width:30px;height:30px;border-radius:50%;
     border:none;background:var(--blue);color:#fff;
@@ -251,6 +269,20 @@
   #info-panel-close{border:none;background:none;font-size:15px;color:var(--blue);cursor:pointer;}
   #info-panel-body{padding:16px;overflow-y:auto;flex:1;}
 
+  /* Toast */
+  #toast{
+    position:fixed;left:50%;bottom:24px;
+    transform:translate(-50%, 12px);
+    background:#1c1c1e;color:#fff;
+    padding:10px 16px;border-radius:10px;
+    font-size:13px;line-height:1.4;
+    opacity:0;pointer-events:none;
+    transition:opacity .2s ease, transform .2s ease;
+    z-index:100;max-width:80%;text-align:center;
+    box-shadow:0 6px 20px rgba(0,0,0,0.2);
+  }
+  #toast.show{opacity:1;transform:translate(-50%, 0);pointer-events:auto;}
+
   @media (max-width:680px){
     #sidebar{
       width:100%;max-width:none;
@@ -269,7 +301,10 @@
 
   <div id="sidebar">
     <div id="sidebar-header">
-      <h1>Messages</h1>
+      <div id="sidebar-header-title">
+        <h1>Messages</h1>
+        <span id="conn-dot" class="conn-disconnected" title="Disconnected"></span>
+      </div>
       <button id="compose-btn" title="New chat">✎</button>
     </div>
     <div id="search-wrap">
@@ -313,8 +348,12 @@
 
   // ---------------- Storage ----------------
   // Private profile data stays in this browser.
-  // Shared chats/messages are stored on the Render server.
-  const API_BASE = '/api/data/';
+  // Shared chats/messages live on the Render server. This page is hosted
+  // statically on GitHub Pages, so it talks to that server over its full
+  // URL (both plain HTTPS calls and a WebSocket), not relative paths.
+  const SERVER_ORIGIN = 'https://messages-server-waf1.onrender.com';
+  const API_BASE = SERVER_ORIGIN + '/api/data/';
+  const WS_URL = SERVER_ORIGIN.replace(/^http/, 'ws') + '/ws';
 
   const privateStorage = {
     async get(key){
@@ -412,6 +451,21 @@
       for(let i=0;i<pw.length;i++){ h = ((h<<5)-h+pw.charCodeAt(i))|0; }
       return 'fb'+h;
     }
+  }
+
+  // ---------------- Toast ----------------
+  // A small transient message shown for non-fatal save/sync issues.
+  function showToast(msg){
+    let el = document.getElementById('toast');
+    if(!el){
+      el = document.createElement('div');
+      el.id = 'toast';
+      document.body.appendChild(el);
+    }
+    el.textContent = msg;
+    el.classList.add('show');
+    clearTimeout(showToast._t);
+    showToast._t = setTimeout(()=> el.classList.remove('show'), 3500);
   }
 
   // ---------------- App state ----------------
@@ -886,12 +940,88 @@
     document.getElementById('main').classList.add('hidden');
   };
 
-  // ---------------- Polling ----------------
-  // Background refresh. Critical rule: a failed read must NEVER overwrite
-  // existing local state with an empty list — that was the bug that made
-  // chats "disappear". We only apply a poll result when the read actually
-  // succeeded.
-  async function pollLoop(){
+  // ---------------- Connection status + WebSocket ----------------
+  // red = disconnected, orange = connecting/reconnecting, green = connected.
+  function setConnStatus(status){ // 'connecting' | 'connected' | 'disconnected'
+    const dot = document.getElementById('conn-dot');
+    if(!dot) return;
+    dot.classList.remove('conn-connecting','conn-connected','conn-disconnected');
+    dot.classList.add('conn-'+status);
+    dot.title = status === 'connected' ? 'Connected'
+      : status === 'connecting' ? 'Connecting…'
+      : 'Disconnected — retrying';
+  }
+
+  let ws = null;
+  let wsReconnectDelay = 1000;
+  const WS_MAX_DELAY = 15000;
+  let wsReconnectTimer = null;
+
+  function connectWS(){
+    setConnStatus('connecting');
+    try{
+      ws = new WebSocket(WS_URL);
+    }catch(e){
+      scheduleReconnect();
+      return;
+    }
+    ws.onopen = ()=>{
+      setConnStatus('connected');
+      wsReconnectDelay = 1000;
+      syncAll(); // catch up on anything missed while disconnected
+    };
+    ws.onmessage = (evt)=>{
+      let msg;
+      try{ msg = JSON.parse(evt.data); }catch(e){ return; }
+      handleWsMessage(msg);
+    };
+    ws.onclose = ()=>{
+      setConnStatus('disconnected');
+      scheduleReconnect();
+    };
+    ws.onerror = ()=>{
+      try{ ws.close(); }catch(e){}
+    };
+  }
+
+  function scheduleReconnect(){
+    if(wsReconnectTimer) return;
+    wsReconnectTimer = setTimeout(()=>{
+      wsReconnectTimer = null;
+      connectWS();
+    }, wsReconnectDelay);
+    wsReconnectDelay = Math.min(wsReconnectDelay * 1.6, WS_MAX_DELAY);
+  }
+
+  function handleWsMessage(msg){
+    if(!msg || msg.type !== 'update' || typeof msg.key !== 'string') return;
+    if(msg.key === 'chats'){
+      if(Array.isArray(msg.value)){
+        state.chats = msg.value;
+        renderChatList();
+        if(state.currentChatId){
+          if(state.chats.find(c=>c.id===state.currentChatId)){
+            renderConvHeader();
+          }else{
+            state.currentChatId = null;
+            showNoChatSelected();
+          }
+        }
+      }
+    }else if(msg.key.indexOf('messages:')===0){
+      const chatId = msg.key.slice('messages:'.length);
+      if(Array.isArray(msg.value)){
+        state.messagesCache[chatId] = msg.value;
+        if(chatId === state.currentChatId) renderMessages(chatId);
+      }
+    }
+  }
+
+  // Best-effort resync, used right after a (re)connect and on a slow
+  // fallback timer in case a push was ever missed. Critical rule: a
+  // failed read must NEVER overwrite existing local state with an empty
+  // list — that was the bug that made chats "disappear" before.
+  async function syncAll(){
     const chatsRes = await getDataOrKeep('chats', true);
     if(chatsRes.changed){
       state.chats = chatsRes.value;
@@ -906,14 +1036,13 @@
           renderMessages(state.currentChatId);
         }
       }else if(chatsRes.changed){
-        // Only treat the chat as genuinely deleted if we successfully
-        // confirmed a fresh chat list that no longer contains it.
         state.currentChatId = null;
         showNoChatSelected();
       }
     }
   }
-  setInterval(pollLoop, 3500);
+  // Realtime updates arrive over the WebSocket; this is just a safety net.
+  setInterval(syncAll, 20000);
 
   // ---------------- Init ----------------
   async function init(){
@@ -934,6 +1063,7 @@
   }
 
   init();
+  connectWS();
 
 })();
 </script>
