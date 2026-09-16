@@ -8,7 +8,7 @@ services:
   - type: web
     name: messages-server
     runtime: node
-    plan: free            # change to "starter" if you enable the disk below
+    plan: free
     region: oregon        # also available: frankfurt, singapore, ohio, virginia
     branch: main
     buildCommand: npm install
@@ -18,26 +18,7 @@ services:
     envVars:
       - key: NODE_VERSION
         value: "20"
-      # DATA_DIR is intentionally NOT set here. Unset, the server writes
-      # data.json into the app folder, which is writable on every plan.
-      # Only set DATA_DIR=/var/data once you attach the disk below,
-      # since /var/data doesn't exist until a disk is mounted there.
 
-    # -----------------------------------------------------------------
-    # PERSISTENT STORAGE
-    #
-    # Without a disk, Render's filesystem is EPHEMERAL: every deploy,
-    # restart, or the free plan's idle-spindown WIPES data.json, so all
-    # chats and messages are lost.
-    #
-    # Disks require a paid instance type (Starter or above). To keep
-    # data permanently:
-    #   1. set `plan: starter` above
-    #   2. add DATA_DIR=/var/data to envVars above
-    #   3. uncomment the disk block below
-    #
-    # disk:
-    #   name: messages-data
-    #   mountPath: /var/data
-    #   sizeGB: 1
-    # -----------------------------------------------------------------
+    # No disk is attached on this plan, so data.json (and all chats/
+    # messages in it) is wiped on every deploy, restart, or idle-
+    # spindown. That's expected and fine for this app's current use.
