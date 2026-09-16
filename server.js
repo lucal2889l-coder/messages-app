@@ -6,12 +6,9 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-// DATA_DIR is unset on Render's free plan (no disk mounted), so this
-// falls back to the app folder — fine for testing, but wiped on every
-// deploy/restart/idle-spindown. Set DATA_DIR=/var/data once a paid
-// plan + disk are attached (see render.yaml).
-const DATA_DIR = process.env.DATA_DIR || __dirname;
-const DATA_FILE = path.join(DATA_DIR, 'data.json');
+// No disk is attached on Render's free plan, so this file lives in the
+// app folder and gets wiped on every deploy/restart/idle-spindown.
+const DATA_FILE = path.join(__dirname, 'data.json');
 
 function loadStore() {
   try {
@@ -61,7 +58,7 @@ app.delete('/api/data/:key', (req, res) => {
 
 app.use(express.static(__dirname));
 
-app.get('*', (req, res) => {
+app.use((req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'));
 });
 
