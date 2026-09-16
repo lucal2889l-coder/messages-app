@@ -84,6 +84,14 @@
     flex-shrink:0;
   }
   #compose-btn:hover{background:var(--blue-dark);}
+  #settings-btn{
+    width:30px;height:30px;border-radius:50%;
+    border:none;background:#e5e5e7;color:var(--text);
+    font-size:14px;cursor:pointer;
+    display:flex;align-items:center;justify-content:center;
+    flex-shrink:0;
+  }
+  #settings-btn:hover{background:#d8d8da;}
   #search-wrap{padding:0 12px 10px 12px;}
   #search-input{
     width:100%;
@@ -167,22 +175,54 @@
     display:flex;
     flex-direction:column;
   }
-  .msg-row{display:flex;margin-bottom:4px;}
+  .msg-row{display:flex;margin-bottom:4px;align-items:flex-end;}
   .msg-row.me{justify-content:flex-end;}
   .msg-row.them{justify-content:flex-start;}
-  .bubble{
+  /* Bubble sizing: max-width lives on this wrapper (whose own width is
+     always definite, since msg-row is stretched full-width by its
+     column-flex parent). The bubble itself is width:fit-content so it
+     hugs the actual message length instead of forcing an artificially
+     narrow box that breaks words mid-word. */
+  .bubble-group{
+    display:flex;
+    flex-direction:column;
     max-width:62%;
+    min-width:0;
+  }
+  .msg-row.me .bubble-group{align-items:flex-end;}
+  .msg-row.them .bubble-group{align-items:flex-start;}
+  .bubble{
+    width:fit-content;
+    max-width:100%;
     padding:8px 14px;
     border-radius:var(--radius-bubble);
     font-size:14.5px;
     line-height:1.35;
     word-wrap:break-word;
+    overflow-wrap:break-word;
     white-space:pre-wrap;
   }
   .msg-row.me .bubble{background:var(--blue);color:#fff;border-bottom-right-radius:5px;}
   .msg-row.them .bubble{background:var(--bubble-in);color:var(--bubble-in-text);border-bottom-left-radius:5px;}
   .msg-meta{font-size:11px;color:var(--text-dim);text-align:center;margin:12px 0 6px 0;}
   .sender-label{font-size:11.5px;color:var(--text-dim);margin:2px 12px 2px 2px;}
+  .msg-avatar{
+    width:28px;height:28px;border-radius:50%;
+    overflow:hidden;flex-shrink:0;margin-right:6px;
+  }
+  .msg-avatar img{width:100%;height:100%;object-fit:cover;display:block;}
+  .typing-bubble{display:flex;align-items:center;gap:4px;padding:11px 14px;}
+  .typing-dot{
+    width:6px;height:6px;border-radius:50%;
+    background:#9a9a9e;display:inline-block;
+    animation:typing-bounce 1.2s infinite ease-in-out;
+  }
+  .typing-dot:nth-child(2){animation-delay:0.15s;}
+  .typing-dot:nth-child(3){animation-delay:0.3s;}
+  @keyframes typing-bounce{
+    0%,60%,100%{transform:translateY(0);opacity:0.5;}
+    30%{transform:translateY(-4px);opacity:1;}
+  }
   #composer{
     display:flex;
     align-items:flex-end;
@@ -292,7 +332,7 @@
     #main.hidden{display:none;}
     #back-btn{display:inline-block;}
     #app{border:none;}
-    .bubble{max-width:78%;}
+    .bubble-group{max-width:78%;}
   }
 </style>
 </head>
@@ -305,7 +345,10 @@
         <h1>Messages</h1>
         <span id="conn-dot" class="conn-disconnected" title="Disconnected"></span>
       </div>
-      <button id="compose-btn" title="New chat">✎</button>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <button id="settings-btn" title="Settings">⚙</button>
+        <button id="compose-btn" title="New chat">✎</button>
+      </div>
     </div>
     <div id="search-wrap">
       <input id="search-input" type="text" placeholder="Search">
@@ -475,6 +518,7 @@
     currentChatId: null,
     unlockedChatIds: new Set(), // session-only
     messagesCache: {},       // chatId -> array of messages
+    profilesCache: {},       // senderId -> {id, name, avatar} | null
     searchTerm: ''
   };
 
@@ -489,6 +533,23 @@
     if(parts.length===0) return '?';
     if(parts.length===1) return parts[0].slice(0,2).toUpperCase();
     return (parts[0][0]+parts[1][0]).toUpperCase();
+  }
+
+  // Only ever render an avatar image if it's actually a well-formed
+  // image data URL — profiles are shared/writable by anyone with the
+  // server URL, so this avoids ever turning a crafted value into markup.
+  function isSafeAvatarDataUrl(url){
+    return typeof url === 'string'
+      && url.length < 200000
+      && /^data:image\/(png|jpe?g|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(url);
+  }
+
+  function avatarHtml(profile, fallbackName){
+    if(profile && isSafeAvatarDataUrl(profile.avatar)){
+      return `<img src="${profile.avatar}" alt="">`;
+    }
+    const name = (profile && profile.name) || fallbackName || '?';
+    return `<div class="avatar" style="width:100%;height:100%;font-size:12px;background:${colorForName(name)};">${initialsForName(name)}</div>`;
   }
 
   function escapeHtml(str){
@@ -529,9 +590,10 @@
     const save = async ()=>{
       const name = input.value.trim();
       if(!name){ document.getElementById('name-error').textContent = 'Please enter a name.'; return; }
-      const profile = {id: genId(), name};
+      const profile = {id: genId(), name, avatar: null};
       await setData('profile', profile, false);
       state.profile = profile;
+      pushProfileToServer(profile);
       closeModal();
       init();
     };
@@ -642,6 +704,149 @@
     input.addEventListener('keydown', e=>{ if(e.key==='Enter') attempt(); });
   }
 
+  // ---------------- Settings / profile (name + photo) ----------------
+  // Reads a chosen image file and downsizes it to a small square-ish
+  // JPEG data URL, so profile photos stay lightweight wherever they're
+  // stored and sent.
+  function readAndResizeImage(file){
+    return new Promise((resolve, reject)=>{
+      const reader = new FileReader();
+      reader.onerror = ()=> reject(new Error('read failed'));
+      reader.onload = ()=>{
+        const img = new Image();
+        img.onerror = ()=> reject(new Error('decode failed'));
+        img.onload = ()=>{
+          const maxDim = 160;
+          let width = img.naturalWidth, height = img.naturalHeight;
+          if(width > height){
+            if(width > maxDim){ height = Math.round(height * (maxDim/width)); width = maxDim; }
+          }else{
+            if(height > maxDim){ width = Math.round(width * (maxDim/height)); height = maxDim; }
+          }
+          const canvas = document.createElement('canvas');
+          canvas.width = width; canvas.height = height;
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0, width, height);
+          resolve(canvas.toDataURL('image/jpeg', 0.82));
+        };
+        img.src = reader.result;
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  // The profile is written to localStorage (the durable, private copy)
+  // AND to the shared server store under profiles:<id>, so other open
+  // browsers can show your name/photo. If the server's storage ever
+  // gets wiped (a Render redeploy/restart), this browser is still the
+  // source of truth, so ensureProfileSynced() below quietly resends it.
+  async function pushProfileToServer(profile){
+    if(!profile) return false;
+    return setData('profiles:'+profile.id, profile, true);
+  }
+
+  async function ensureProfileSynced(){
+    if(!state.profile) return;
+    const res = await getDataOrKeep('profiles:'+state.profile.id, true);
+    if(!res.changed) return; // offline/failed read — don't guess, try again later
+    const serverCopy = res.value;
+    const matches = serverCopy
+      && serverCopy.name === state.profile.name
+      && serverCopy.avatar === state.profile.avatar;
+    if(!matches){
+      await pushProfileToServer(state.profile);
+    }
+  }
+
+  function showSettingsModal(){
+    const currentAvatar = state.profile && state.profile.avatar;
+    const currentName = state.profile ? state.profile.name : '';
+    openModal(`
+      <div class="modal">
+        <h2>Your Profile</h2>
+        <div style="display:flex;align-items:center;gap:14px;margin-bottom:4px;">
+          <div class="avatar" id="settings-avatar-preview" style="width:56px;height:56px;font-size:20px;background:${colorForName(currentName || '?')}">
+            ${isSafeAvatarDataUrl(currentAvatar) ? `<img src="${currentAvatar}" alt="" style="width:100%;height:100%;border-radius:50%;object-fit:cover;">` : initialsForName(currentName || '?')}
+          </div>
+          <div>
+            <button class="btn btn-secondary" type="button" id="settings-upload-btn">Upload photo</button>
+            <div id="settings-remove-wrap" style="margin-top:6px;${isSafeAvatarDataUrl(currentAvatar) ? '' : 'display:none;'}">
+              <button class="btn btn-secondary" type="button" id="settings-remove-btn" style="font-size:12px;padding:4px 10px;">Remove photo</button>
+            </div>
+          </div>
+        </div>
+        <input type="file" id="settings-file-input" accept="image/*" style="display:none;">
+        <div class="field-label">Display name</div>
+        <input id="settings-name-input" class="field-input" type="text" maxlength="30" value="${escapeHtml(currentName)}">
+        <div class="error-text" id="settings-error"></div>
+        <div class="modal-actions">
+          <button class="btn btn-secondary" id="settings-cancel">Cancel</button>
+          <button class="btn btn-primary" id="settings-save">Save</button>
+        </div>
+      </div>
+    `);
+
+    let pendingAvatar = isSafeAvatarDataUrl(currentAvatar) ? currentAvatar : null;
+    let avatarRemoved = false;
+
+    const preview = document.getElementById('settings-avatar-preview');
+    const removeWrap = document.getElementById('settings-remove-wrap');
+    const nameInput = document.getElementById('settings-name-input');
+
+    function updatePreview(){
+      const name = nameInput.value.trim() || '?';
+      preview.style.background = colorForName(name);
+      if(pendingAvatar){
+        preview.innerHTML = `<img src="${pendingAvatar}" alt="" style="width:100%;height:100%;border-radius:50%;object-fit:cover;">`;
+        removeWrap.style.display = '';
+      }else{
+        preview.innerHTML = initialsForName(name);
+        removeWrap.style.display = 'none';
+      }
+    }
+
+    document.getElementById('settings-upload-btn').onclick = ()=> document.getElementById('settings-file-input').click();
+    document.getElementById('settings-file-input').addEventListener('change', async (e)=>{
+      const file = e.target.files[0];
+      if(!file) return;
+      const errEl = document.getElementById('settings-error');
+      errEl.textContent = '';
+      try{
+        pendingAvatar = await readAndResizeImage(file);
+        avatarRemoved = false;
+        updatePreview();
+      }catch(err){
+        errEl.textContent = "Couldn't read that image — try a different file.";
+      }
+    });
+    document.getElementById('settings-remove-btn').onclick = ()=>{
+      pendingAvatar = null;
+      avatarRemoved = true;
+      updatePreview();
+    };
+    nameInput.addEventListener('input', updatePreview);
+    document.getElementById('settings-cancel').onclick = closeModal;
+    nameInput.focus();
+
+    document.getElementById('settings-save').onclick = async ()=>{
+      const errEl = document.getElementById('settings-error');
+      const name = nameInput.value.trim();
+      if(!name){ errEl.textContent = 'Please enter a name.'; return; }
+      const profile = {
+        id: state.profile.id,
+        name,
+        avatar: avatarRemoved ? null : (pendingAvatar || null)
+      };
+      state.profile = profile;
+      await setData('profile', profile, false);
+      const ok = await pushProfileToServer(profile);
+      closeModal();
+      renderChatList();
+      if(state.currentChatId) renderMessages(state.currentChatId);
+      if(!ok) showToast("Saved on this device — it'll resend to the server automatically once it's reachable.");
+    };
+  }
+
   function showDeleteConfirm(chat){
     openModal(`
       <div class="modal">
@@ -722,6 +927,7 @@
   }
 
   async function openChat(chatId){
+    clearTypingUsers();
     state.currentChatId = chatId;
     document.getElementById('info-panel').style.display = 'none';
     if(window.innerWidth <= 680){
@@ -753,6 +959,7 @@
     const wasNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
     let lastDay = null;
     let html = '';
+    const missingProfiles = new Set();
     msgs.forEach(m=>{
       const day = new Date(m.ts).toDateString();
       if(day !== lastDay){
@@ -761,13 +968,30 @@
       }
       const mine = m.senderId === state.profile.id;
       html += `<div class="msg-row ${mine?'me':'them'}">`;
-      html += `<div>`;
+      if(!mine){
+        const prof = state.profilesCache[m.senderId];
+        if(prof === undefined) missingProfiles.add(m.senderId);
+        html += `<div class="msg-avatar">${avatarHtml(prof, m.senderName)}</div>`;
+      }
+      html += `<div class="bubble-group">`;
       if(!mine) html += `<div class="sender-label">${escapeHtml(m.senderName)}</div>`;
       html += `<div class="bubble">${escapeHtml(m.text)}</div>`;
       html += `</div></div>`;
     });
     el.innerHTML = html || '';
+    renderTypingBubble();
     if(wasNearBottom){ el.scrollTop = el.scrollHeight; }
+    // Progressively fetch any sender profiles (for their avatar) we
+    // haven't seen yet, then re-render once — never blocks the initial
+    // paint, which already falls back to colored initials.
+    if(missingProfiles.size){
+      Promise.all(Array.from(missingProfiles).map(async uid=>{
+        const p = await getData('profiles:'+uid, true, null);
+        state.profilesCache[uid] = p;
+      })).then(()=>{
+        if(chatId === state.currentChatId) renderMessages(chatId);
+      });
+    }
   }
 
   async function refreshMessages(chatId, forceScroll){
@@ -923,9 +1147,71 @@
     renderChatList();
   });
 
+  // ---------------- Typing indicator ----------------
+  // Ephemeral, relayed live over the WebSocket — never written to the
+  // persisted store. Shows as a three-dot bubble at the end of the
+  // conversation, like a normal incoming message, with the name(s)
+  // of whoever's typing above it.
+  const typingUsers = new Map(); // senderId -> {name, timeoutId}
+  let lastTypingSentAt = 0;
+
+  function clearTypingUsers(){
+    typingUsers.forEach(u => clearTimeout(u.timeoutId));
+    typingUsers.clear();
+  }
+
+  function renderTypingBubble(){
+    const el = document.getElementById('messages-scroll');
+    if(!el) return;
+    let bubble = document.getElementById('typing-bubble-row');
+    if(typingUsers.size === 0){
+      if(bubble) bubble.remove();
+      return;
+    }
+    const entries = Array.from(typingUsers.entries());
+    const names = entries.map(([,u])=>u.name);
+    let label;
+    if(names.length === 1) label = names[0] + ' is typing';
+    else if(names.length === 2) label = names[0] + ' and ' + names[1] + ' are typing';
+    else label = names.slice(0,-1).join(', ') + ', and ' + names[names.length-1] + ' are typing';
+    const wasNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    if(!bubble){
+      bubble = document.createElement('div');
+      bubble.id = 'typing-bubble-row';
+      bubble.className = 'msg-row them';
+    }
+    const prof = state.profilesCache[entries[0][0]];
+    bubble.innerHTML = `
+      <div class="msg-avatar">${avatarHtml(prof, names[0])}</div>
+      <div class="bubble-group">
+        <div class="sender-label">${escapeHtml(label)}</div>
+        <div class="bubble typing-bubble"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></div>
+      </div>
+    `;
+    el.appendChild(bubble);
+    if(wasNearBottom) el.scrollTop = el.scrollHeight;
+  }
+
+  function sendTypingSignal(){
+    if(!state.currentChatId || !state.profile) return;
+    const now = Date.now();
+    if(now - lastTypingSentAt < 1500) return; // throttle
+    lastTypingSentAt = now;
+    if(ws && ws.readyState === WebSocket.OPEN){
+      try{
+        ws.send(JSON.stringify({
+          type:'typing',
+          chatId: state.currentChatId,
+          senderId: state.profile.id,
+          senderName: state.profile.name
+        }));
+      }catch(e){}
+    }
+  }
+
   // ---------------- Composer events ----------------
   const msgInput = document.getElementById('msg-input');
-  msgInput.addEventListener('input', ()=>{ autosizeInput(msgInput); updateSendBtn(); });
+  msgInput.addEventListener('input', ()=>{ autosizeInput(msgInput); updateSendBtn(); sendTypingSignal(); });
   msgInput.addEventListener('keydown', e=>{
     if(e.key==='Enter' && !e.shiftKey){
       e.preventDefault();
@@ -934,6 +1220,7 @@
   });
   document.getElementById('send-btn').onclick = sendMessage;
   document.getElementById('compose-btn').onclick = showNewChatModal;
+  document.getElementById('settings-btn').onclick = showSettingsModal;
   document.getElementById('info-btn').onclick = toggleInfoPanel;
   document.getElementById('back-btn').onclick = ()=>{
     document.getElementById('sidebar').classList.remove('hidden');
@@ -994,7 +1281,23 @@
   }
 
   function handleWsMessage(msg){
-    if(!msg || msg.type !== 'update' || typeof msg.key !== 'string') return;
+    if(!msg || typeof msg.type !== 'string') return;
+
+    if(msg.type === 'typing'){
+      if(!state.profile || msg.senderId === state.profile.id) return; // ignore our own
+      if(msg.chatId !== state.currentChatId) return; // only care about the open chat
+      const existing = typingUsers.get(msg.senderId);
+      if(existing) clearTimeout(existing.timeoutId);
+      const timeoutId = setTimeout(()=>{
+        typingUsers.delete(msg.senderId);
+        renderTypingBubble();
+      }, 3000);
+      typingUsers.set(msg.senderId, {name: msg.senderName || 'Someone', timeoutId});
+      renderTypingBubble();
+      return;
+    }
+
+    if(msg.type !== 'update' || typeof msg.key !== 'string') return;
     if(msg.key === 'chats'){
       if(Array.isArray(msg.value)){
         state.chats = msg.value;
@@ -1004,6 +1307,7 @@
             renderConvHeader();
           }else{
             state.currentChatId = null;
+            clearTypingUsers();
             showNoChatSelected();
           }
         }
@@ -1014,6 +1318,11 @@
         state.messagesCache[chatId] = msg.value;
         if(chatId === state.currentChatId) renderMessages(chatId);
       }
+    }else if(msg.key.indexOf('profiles:')===0){
+      const uid = msg.key.slice('profiles:'.length);
+      state.profilesCache[uid] = msg.value;
+      renderChatList();
+      if(state.currentChatId) renderMessages(state.currentChatId);
     }
   }
 
@@ -1022,6 +1331,7 @@
   // failed read must NEVER overwrite existing local state with an empty
   // list — that was the bug that made chats "disappear" before.
   async function syncAll(){
+    await ensureProfileSynced();
     const chatsRes = await getDataOrKeep('chats', true);
     if(chatsRes.changed){
       state.chats = chatsRes.value;
@@ -1037,6 +1347,7 @@
         }
       }else if(chatsRes.changed){
         state.currentChatId = null;
+        clearTypingUsers();
         showNoChatSelected();
       }
     }
