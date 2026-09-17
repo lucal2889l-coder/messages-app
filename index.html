@@ -344,6 +344,12 @@
   }
   .theme-swatch-dot{width:40%;height:40%;border-radius:50%;}
   .theme-swatch-label{font-size:9.5px;color:var(--text-dim);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .dm-user-list{display:flex;flex-direction:column;gap:4px;max-height:140px;overflow-y:auto;margin-bottom:4px;}
+  .dm-user-row{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:8px;cursor:pointer;border:1px solid transparent;}
+  .dm-user-row:hover{background:var(--surface);}
+  .dm-user-row.selected{background:var(--surface);border-color:var(--blue);}
+  .dm-user-avatar{width:26px;height:26px;font-size:11px;border-radius:50%;overflow:hidden;position:relative;flex-shrink:0;}
+  .dm-user-empty{font-size:12.5px;color:var(--text-dim);padding:6px 2px;}
   .reply-preview{
     border-left:3px solid var(--blue);
     background:rgba(11,132,255,0.07);
@@ -1017,8 +1023,13 @@
           <input type="checkbox" id="new-chat-dm">
           <label for="new-chat-dm">Direct message (just the two of you)</label>
         </div>
+        <div id="dm-user-list-wrap" style="display:none;">
+          <div class="field-label" style="margin-top:0;">Pick who's online</div>
+          <div id="dm-user-list" class="dm-user-list"></div>
+        </div>
         <div class="field-label" id="new-chat-title-label">Chat name</div>
         <input id="new-chat-title" class="field-input" type="text" placeholder="e.g. Weekend Trip" maxlength="40" autofocus>
+        <div class="subtle-note" id="dm-privacy-note" style="display:none;"></div>
         <div class="checkbox-row">
           <input type="checkbox" id="new-chat-locked">
           <label for="new-chat-locked">Lock this chat with a password</label>
@@ -1042,15 +1053,72 @@
     const dmBox = document.getElementById('new-chat-dm');
     const titleLabel = document.getElementById('new-chat-title-label');
     const titleInput = document.getElementById('new-chat-title');
+    const dmListWrap = document.getElementById('dm-user-list-wrap');
+    const dmNote = document.getElementById('dm-privacy-note');
+
+    let selectedDmUserId = null;
+    let selectedDmUserName = null;
+
+    function renderDmUserList(){
+      const wrap = document.getElementById('dm-user-list');
+      const others = state.onlineUsers.filter(u => !state.profile || u.id !== state.profile.id);
+      if(others.length === 0){
+        wrap.innerHTML = '<div class="dm-user-empty">No one else is online right now — type their name below instead.</div>';
+        return;
+      }
+      wrap.innerHTML = others.map(u=>{
+        const prof = state.profilesCache[u.id];
+        const sel = u.id === selectedDmUserId;
+        return `<div class="dm-user-row${sel?' selected':''}" data-user-id="${u.id}" data-user-name="${escapeHtml(u.name)}">
+          <div class="dm-user-avatar">${avatarHtml(prof, u.name, u.id)}</div>
+          <span>${escapeHtml(u.name)}</span>
+        </div>`;
+      }).join('');
+      wrap.querySelectorAll('.dm-user-row').forEach(row=>{
+        row.onclick = ()=>{
+          selectedDmUserId = row.getAttribute('data-user-id');
+          selectedDmUserName = row.getAttribute('data-user-name');
+          titleInput.value = selectedDmUserName;
+          updateDmNote();
+          renderDmUserList();
+        };
+      });
+    }
+
+    function updateDmNote(){
+      if(!dmBox.checked){ dmNote.style.display = 'none'; return; }
+      dmNote.style.display = 'block';
+      if(selectedDmUserId){
+        dmNote.textContent = 'Private — only you and ' + selectedDmUserName + ' will see this chat.';
+      }else{
+        dmNote.textContent = "Typed by hand, so it can't be restricted to just them — anyone with the access key can still see this chat. Pick them from the list above if they're online, for a genuinely private DM.";
+      }
+    }
+
     dmBox.onchange = ()=>{
       if(dmBox.checked){
         titleLabel.textContent = "Who's this with?";
         titleInput.placeholder = 'Their name';
+        dmListWrap.style.display = 'block';
+        renderDmUserList();
       }else{
         titleLabel.textContent = 'Chat name';
         titleInput.placeholder = 'e.g. Weekend Trip';
+        dmListWrap.style.display = 'none';
+        selectedDmUserId = null;
+        selectedDmUserName = null;
       }
+      updateDmNote();
     };
+    titleInput.addEventListener('input', ()=>{
+      if(dmBox.checked && selectedDmUserId && titleInput.value !== selectedDmUserName){
+        selectedDmUserId = null;
+        selectedDmUserName = null;
+        updateDmNote();
+        renderDmUserList();
+      }
+    });
+
     document.getElementById('new-chat-cancel').onclick = closeModal;
     titleInput.focus();
 
@@ -1071,6 +1139,9 @@
         id: genId(),
         title,
         isDM: dmBox.checked,
+        participantIds: (dmBox.checked && selectedDmUserId && state.profile)
+          ? [state.profile.id, selectedDmUserId]
+          : null,
         locked,
         passwordHash,
         createdAt: Date.now(),
@@ -1299,9 +1370,18 @@
   }
 
   // ---------------- Rendering: sidebar ----------------
+  function visibleChats(){
+    return state.chats.filter(c=>{
+      if(c.isDM && Array.isArray(c.participantIds) && c.participantIds.length){
+        return state.profile && c.participantIds.includes(state.profile.id);
+      }
+      return true; // group chats, and DMs with no known participants, stay visible to everyone
+    });
+  }
+
   function renderChatList(){
     const list = document.getElementById('chat-list');
-    let chats = state.chats.slice().sort((a,b)=>b.lastMessageAt - a.lastMessageAt);
+    let chats = visibleChats().sort((a,b)=>b.lastMessageAt - a.lastMessageAt);
     if(state.searchTerm){
       const q = state.searchTerm.toLowerCase();
       chats = chats.filter(c=>c.title.toLowerCase().includes(q));
@@ -1350,6 +1430,11 @@
   async function selectChat(chatId){
     const chat = state.chats.find(c=>c.id===chatId);
     if(!chat) return;
+    if(chat.isDM && Array.isArray(chat.participantIds) && chat.participantIds.length &&
+       (!state.profile || !chat.participantIds.includes(state.profile.id))){
+      showToast("You don't have access to this chat.");
+      return;
+    }
     if(chat.locked && !state.unlockedChatIds.has(chat.id)){
       showPasswordPrompt(chat, ()=> openChat(chatId));
       return;
@@ -1806,7 +1891,7 @@
         </div>
         <div style="height:1px;background:var(--border);margin:18px 0;"></div>
         <button class="btn btn-danger" id="info-delete" style="width:100%;">Delete Chat</button>
-        <div class="subtle-note">Passwords lock the chat behind a prompt in this app, but this isn't real encryption — treat it as a privacy convenience, not a secure vault. The same goes for direct messages: anyone signed in with the access key can still open any chat, DM or not.</div>
+        <div class="subtle-note">Passwords lock the chat behind a prompt in this app, but this isn't real encryption — treat it as a privacy convenience, not a secure vault. Direct messages started by picking someone from the online list are hidden from everyone else's chat list; ones where the name was just typed in aren't restricted to anyone in particular.</div>
       </div>
     `;
     document.getElementById('info-panel-close').onclick = toggleInfoPanel;
