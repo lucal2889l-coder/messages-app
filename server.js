@@ -5,7 +5,7 @@ const http = require('http');
 const { WebSocketServer, WebSocket } = require('ws');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '5mb' })); // messages can now carry resized images
 
 // Allow the GitHub Pages frontend (a different origin) to call this API.
 app.use((req, res, next) => {
@@ -41,6 +41,10 @@ let store = loadStore();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
+// Tracks which connected sockets belong to which identified user, purely
+// in memory, so we can show a live "who's online" list. Never persisted.
+const clients = new Map(); // ws -> { id, name }
+
 function broadcast(msg) {
   const data = JSON.stringify(msg);
   wss.clients.forEach((client) => {
@@ -54,13 +58,57 @@ function broadcast(msg) {
   });
 }
 
+function broadcastPresence() {
+  const online = Array.from(clients.values()).map((c) => ({ id: c.id, name: c.name }));
+  broadcast({ type: 'presence', online });
+}
+
 wss.on('connection', (ws) => {
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
   ws.on('error', (err) => {
     console.error('WebSocket client error:', err.message);
   });
-  ws.send(JSON.stringify({ type: 'hello' }));
+
+  ws.on('message', (data) => {
+    let msg;
+    try {
+      msg = JSON.parse(data.toString());
+    } catch (e) {
+      return;
+    }
+    if (!msg || typeof msg.type !== 'string') return;
+
+    if (msg.type === 'identify' && typeof msg.id === 'string' && typeof msg.name === 'string') {
+      clients.set(ws, { id: msg.id.slice(0, 200), name: msg.name.slice(0, 60) });
+      broadcastPresence();
+      return;
+    }
+
+    // Ephemeral typing relay — never persisted, only forwarded live.
+    if (
+      msg.type === 'typing' &&
+      typeof msg.chatId === 'string' &&
+      typeof msg.senderId === 'string' &&
+      typeof msg.senderName === 'string'
+    ) {
+      broadcast({
+        type: 'typing',
+        chatId: msg.chatId.slice(0, 200),
+        senderId: msg.senderId.slice(0, 200),
+        senderName: msg.senderName.slice(0, 60)
+      });
+    }
+  });
+
+  ws.on('close', () => {
+    if (clients.has(ws)) {
+      clients.delete(ws);
+      broadcastPresence();
+    }
+  });
+
+  ws.send(JSON.stringify({ type: 'hello', online: Array.from(clients.values()) }));
 });
 
 wss.on('error', (err) => {
@@ -70,7 +118,13 @@ wss.on('error', (err) => {
 // Drop dead connections (helps behind proxies like Render's).
 const heartbeatInterval = setInterval(() => {
   wss.clients.forEach((ws) => {
-    if (ws.isAlive === false) return ws.terminate();
+    if (ws.isAlive === false) {
+      if (clients.has(ws)) {
+        clients.delete(ws);
+        broadcastPresence();
+      }
+      return ws.terminate();
+    }
     ws.isAlive = false;
     try { ws.ping(); } catch (e) {}
   });
