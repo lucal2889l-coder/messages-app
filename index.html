@@ -64,6 +64,7 @@
     display:flex;
     flex-direction:column;
     flex-shrink:0;
+    position:relative;
   }
   #sidebar-header{
     display:flex;
@@ -76,6 +77,7 @@
     align-items:center;
     gap:7px;
     min-width:0;
+    flex-wrap:wrap;
   }
   #sidebar-header h1{
     font-size:20px;
@@ -93,7 +95,25 @@
   #conn-dot.conn-connecting{background:var(--warn);}
   #conn-dot.conn-connected{background:var(--ok);}
   #conn-dot.conn-disconnected{background:var(--danger);}
-  .online-count{font-size:11px;color:var(--text-dim);white-space:nowrap;}
+  .online-count{
+    font-size:11px;color:var(--text-dim);white-space:nowrap;
+    cursor:pointer;text-decoration:underline;text-decoration-style:dotted;
+    text-underline-offset:2px;
+  }
+  .online-panel{
+    display:none;
+    position:absolute;top:46px;left:12px;
+    background:#fff;border:1px solid var(--border);border-radius:12px;
+    box-shadow:0 8px 30px rgba(0,0,0,0.15);
+    padding:6px;width:200px;max-height:260px;overflow-y:auto;
+    z-index:60;
+  }
+  .online-panel.show{display:block;}
+  .online-panel-empty{font-size:12.5px;color:var(--text-dim);padding:8px;}
+  .online-panel-row{display:flex;align-items:center;gap:8px;padding:6px;border-radius:8px;font-size:13px;}
+  .online-panel-row:hover{background:#f2f2f3;}
+  .online-panel-avatar{width:24px;height:24px;border-radius:50%;overflow:hidden;flex-shrink:0;position:relative;}
+  .online-panel-avatar img{width:100%;height:100%;object-fit:cover;display:block;}
   #compose-btn, #settings-btn{
     width:30px;height:30px;border-radius:50%;
     border:none;color:#fff;
@@ -198,11 +218,6 @@
   .msg-row{display:flex;margin-bottom:6px;align-items:flex-end;}
   .msg-row.me{justify-content:flex-end;}
   .msg-row.them{justify-content:flex-start;}
-  /* Bubble sizing: max-width lives on this wrapper (whose own width is
-     always definite, since msg-row is stretched full-width by its
-     column-flex parent). The bubble itself is width:fit-content so it
-     hugs the actual message length instead of forcing an artificially
-     narrow box that breaks words mid-word. */
   .bubble-group{
     display:flex;
     flex-direction:column;
@@ -226,7 +241,7 @@
     display:block;max-width:220px;max-height:260px;width:100%;height:auto;
     border-radius:14px;object-fit:cover;
   }
-  .msg-image + .msg-text{margin-top:6px;}
+  .msg-image + .msg-text, .msg-image + .msg-image{margin-top:6px;}
   .msg-row.me .bubble{background:var(--blue);color:#fff;border-bottom-right-radius:5px;}
   .msg-row.them .bubble{background:var(--bubble-in);color:var(--bubble-in-text);border-bottom-left-radius:5px;}
   .msg-meta{font-size:11px;color:var(--text-dim);text-align:center;margin:14px 0 6px 0;}
@@ -293,6 +308,10 @@
     border:none;background:none;font-size:20px;cursor:pointer;
     padding:4px 2px;flex-shrink:0;color:var(--text-dim);
   }
+  .gif-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;max-height:260px;overflow-y:auto;}
+  .gif-thumb{border-radius:8px;overflow:hidden;cursor:pointer;background:#f0f0f1;aspect-ratio:1/1;}
+  .gif-thumb img{width:100%;height:100%;object-fit:cover;display:block;}
+  .gif-grid-loading, .gif-grid-empty{grid-column:1/-1;font-size:12.5px;color:var(--text-dim);text-align:center;padding:16px 4px;}
 
   #composer{
     display:flex;
@@ -445,13 +464,14 @@
       <div id="sidebar-header-title">
         <h1>Messages</h1>
         <span id="conn-dot" class="conn-disconnected" title="Disconnected"></span>
-        <span id="online-count" class="online-count"></span>
+        <span id="online-count" class="online-count" title="Click to see who"></span>
       </div>
       <div style="display:flex;align-items:center;gap:8px;">
         <button id="settings-btn" title="Settings">⚙</button>
         <button id="compose-btn" title="New chat">✎</button>
       </div>
     </div>
+    <div id="online-panel" class="online-panel"></div>
     <div id="search-wrap">
       <input id="search-input" type="text" placeholder="Search">
     </div>
@@ -489,7 +509,7 @@
     </div>
 
     <div id="composer" style="display:none;">
-      <button id="attach-btn" title="Attach photo">📷</button>
+      <button id="attach-btn" title="Photo or GIF">📷</button>
       <textarea id="msg-input" rows="1" placeholder="iMessage"></textarea>
       <button id="send-btn">↑</button>
     </div>
@@ -512,7 +532,39 @@
   // URL (both plain HTTPS calls and a WebSocket), not relative paths.
   const SERVER_ORIGIN = 'https://messages-server-waf1.onrender.com';
   const API_BASE = SERVER_ORIGIN + '/api/data/';
-  const WS_URL = SERVER_ORIGIN.replace(/^http/, 'ws') + '/ws';
+  const WS_BASE_URL = SERVER_ORIGIN.replace(/^http/, 'ws') + '/ws';
+  const GIF_REPO_API = 'https://api.github.com/repos/lucal2889l-coder/messages-app/contents/gifs';
+
+  // ---------------- Access key ----------------
+  // The real key lives only on the server. This browser just proves it
+  // knows the key (via /api/auth) and then re-sends it on every request
+  // — the server is what actually enforces access, not this file.
+  const GATE_KEY_STORAGE = 'site_key';
+  let SITE_KEY_VALUE = null;
+
+  function getStoredSiteKey(){
+    try{ return localStorage.getItem(GATE_KEY_STORAGE); }catch(e){ return null; }
+  }
+  async function verifyKeyWithServer(key){
+    try{
+      const res = await fetch(SERVER_ORIGIN + '/api/auth', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({key})
+      });
+      return res.ok;
+    }catch(e){
+      return false;
+    }
+  }
+  function siteKeyHeaders(extra){
+    return Object.assign({'X-Site-Key': SITE_KEY_VALUE || ''}, extra || {});
+  }
+  function handleUnauthorized(){
+    try{ localStorage.removeItem(GATE_KEY_STORAGE); }catch(e){}
+    showToast('Access key no longer valid — reloading.');
+    setTimeout(()=> location.reload(), 1200);
+  }
 
   const privateStorage = {
     async get(key){
@@ -531,7 +583,10 @@
   };
 
   async function serverGet(key){
-    const res = await fetch(API_BASE + encodeURIComponent(key));
+    const res = await fetch(API_BASE + encodeURIComponent(key), {
+      headers: siteKeyHeaders()
+    });
+    if(res.status === 401){ handleUnauthorized(); throw new Error('unauthorized'); }
     if(res.status === 404) throw new Error('key not found');
     if(!res.ok) throw new Error('server read failed');
     const data = await res.json();
@@ -541,9 +596,10 @@
   async function serverSet(key, value){
     const res = await fetch(API_BASE + encodeURIComponent(key), {
       method:'PUT',
-      headers:{'Content-Type':'application/json'},
+      headers: siteKeyHeaders({'Content-Type':'application/json'}),
       body:JSON.stringify({value: JSON.parse(value)})
     });
+    if(res.status === 401){ handleUnauthorized(); throw new Error('unauthorized'); }
     if(!res.ok) throw new Error('server write failed');
     const data = await res.json();
     return {key, value: JSON.stringify(data.value), shared:true};
@@ -559,7 +615,11 @@
 
   async function storageDelete(key, shared){
     if(shared){
-      const res = await fetch(API_BASE + encodeURIComponent(key), {method:'DELETE'});
+      const res = await fetch(API_BASE + encodeURIComponent(key), {
+        method:'DELETE',
+        headers: siteKeyHeaders()
+      });
+      if(res.status === 401){ handleUnauthorized(); throw new Error('unauthorized'); }
       if(!res.ok && res.status !== 404) throw new Error('server delete failed');
       return {key, deleted:true, shared:true};
     }
@@ -605,7 +665,6 @@
       const buf = await crypto.subtle.digest('SHA-256', enc);
       return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
     }catch(e){
-      // fallback simple hash if subtlecrypto unavailable
       let h = 0;
       for(let i=0;i<pw.length;i++){ h = ((h<<5)-h+pw.charCodeAt(i))|0; }
       return 'fb'+h;
@@ -626,6 +685,27 @@
     showToast._t = setTimeout(()=> el.classList.remove('show'), 3500);
   }
 
+  // ---------------- Favicon ----------------
+  function setFavicon(emoji){
+    let link = document.querySelector('link[rel="icon"]');
+    if(!link){
+      link = document.createElement('link');
+      link.rel = 'icon';
+      document.head.appendChild(link);
+    }
+    try{
+      const canvas = document.createElement('canvas');
+      canvas.width = 64; canvas.height = 64;
+      const ctx = canvas.getContext('2d');
+      ctx.font = '54px serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(emoji, 32, 36);
+      link.href = canvas.toDataURL('image/png');
+    }catch(e){}
+  }
+  setFavicon('💬'); // default tab icon, shown even before the gate is passed
+
   // ---------------- App state ----------------
   const state = {
     profile: null,          // {id, name, avatar}
@@ -634,7 +714,7 @@
     unlockedChatIds: new Set(), // session-only
     messagesCache: {},       // chatId -> array of messages
     profilesCache: {},       // senderId -> {id, name, avatar} | null
-    onlineUserIds: new Set(),
+    onlineUsers: [],         // [{id, name}]
     unreadCounts: {},        // chatId -> count (local only, resets on reload)
     expandedMsgId: null,     // message currently showing its detail/actions row
     replyingTo: null,        // {id, senderName, preview}
@@ -644,6 +724,10 @@
 
   const QUICK_REACT_EMOJIS = ['👍','❤️','😂','😮','😢','🙏'];
   const BASE_TITLE = document.title;
+
+  function isOnline(id){
+    return id && state.onlineUsers.some(u => u.id === id);
+  }
 
   const AVATAR_COLORS = ['#ff9500','#ff3b30','#af52de','#5856d6','#007aff','#34c759','#ff2d55','#5ac8fa','#ffcc00'];
   function colorForName(name){
@@ -658,14 +742,15 @@
     return (parts[0][0]+parts[1][0]).toUpperCase();
   }
 
-  // Only ever render an <img> if the value is actually a well-formed
-  // image data URL — profiles/messages are shared/writable by anyone
-  // with the server URL, so this avoids ever turning a crafted string
-  // into markup.
   function isSafeImageDataUrl(url, maxLen){
     return typeof url === 'string'
       && url.length < (maxLen || 200000)
       && /^data:image\/(png|jpe?g|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(url);
+  }
+  function isSafeGifUrl(url){
+    return typeof url === 'string'
+      && url.length < 2000
+      && /^https:\/\/raw\.githubusercontent\.com\//.test(url);
   }
 
   function avatarHtml(profile, fallbackName, senderId){
@@ -676,7 +761,7 @@
       const name = (profile && profile.name) || fallbackName || '?';
       inner = `<div class="avatar" style="width:100%;height:100%;font-size:12px;background:${colorForName(name)};">${initialsForName(name)}</div>`;
     }
-    const online = senderId && state.onlineUserIds.has(senderId);
+    const online = isOnline(senderId);
     return inner + (online ? '<span class="presence-dot" title="Online"></span>' : '');
   }
 
@@ -700,25 +785,6 @@
   function totalUnread(){
     return Object.values(state.unreadCounts).reduce((a,b)=>a+b,0);
   }
-  function setFavicon(emoji){
-    let link = document.querySelector('link[rel="icon"]');
-    if(!link){
-      link = document.createElement('link');
-      link.rel = 'icon';
-      document.head.appendChild(link);
-    }
-    if(!emoji){ link.href = ''; return; }
-    try{
-      const canvas = document.createElement('canvas');
-      canvas.width = 64; canvas.height = 64;
-      const ctx = canvas.getContext('2d');
-      ctx.font = '54px serif';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(emoji, 32, 36);
-      link.href = canvas.toDataURL('image/png');
-    }catch(e){}
-  }
   function updateUnreadUI(){
     const total = totalUnread();
     if(total > 0){
@@ -726,7 +792,7 @@
       setFavicon('⚠️');
     }else{
       document.title = BASE_TITLE;
-      setFavicon(null);
+      setFavicon('💬');
     }
   }
   document.addEventListener('visibilitychange', ()=>{
@@ -736,6 +802,48 @@
         updateUnreadUI();
         renderChatList();
       }
+    }
+  });
+
+  // ---------------- Online presence ----------------
+  function sendIdentify(){
+    if(ws && ws.readyState === WebSocket.OPEN && state.profile){
+      try{
+        ws.send(JSON.stringify({type:'identify', id: state.profile.id, name: state.profile.name}));
+      }catch(e){}
+    }
+  }
+  function updateOnlineCountUI(){
+    const el = document.getElementById('online-count');
+    if(!el) return;
+    const n = state.onlineUsers.length;
+    el.textContent = n > 0 ? (n + ' online') : '';
+    renderOnlinePanel();
+  }
+  function renderOnlinePanel(){
+    const panel = document.getElementById('online-panel');
+    if(!panel) return;
+    if(state.onlineUsers.length === 0){
+      panel.innerHTML = '<div class="online-panel-empty">No one else is online.</div>';
+      return;
+    }
+    panel.innerHTML = state.onlineUsers.map(u=>{
+      const prof = state.profilesCache[u.id];
+      const mine = state.profile && u.id === state.profile.id;
+      return `<div class="online-panel-row">
+        <div class="online-panel-avatar">${avatarHtml(prof, u.name, u.id)}</div>
+        <span>${escapeHtml(u.name)}${mine ? ' (you)' : ''}</span>
+      </div>`;
+    }).join('');
+  }
+  document.getElementById('online-count').onclick = (e)=>{
+    e.stopPropagation();
+    document.getElementById('online-panel').classList.toggle('show');
+  };
+  document.addEventListener('click', (e)=>{
+    const panel = document.getElementById('online-panel');
+    if(panel && panel.classList.contains('show') && !panel.contains(e.target) && e.target.id !== 'online-count'){
+      panel.classList.remove('show');
     }
   });
 
@@ -844,15 +952,13 @@
         lastSenderName: '',
         lastSenderId: null
       };
-      // Read the freshest chat list before writing, falling back to our
-      // current in-memory list (never to an empty array) if that read fails.
       const fresh = await getDataOrKeep('chats', true);
       const baseChats = fresh.changed ? fresh.value : state.chats;
       baseChats.unshift(chat);
       state.chats = baseChats;
       const ok = await setData('chats', state.chats, true);
       await setData('messages:'+chat.id, [], true);
-      state.unlockedChatIds.add(chat.id); // creator starts unlocked
+      state.unlockedChatIds.add(chat.id);
       closeModal();
       renderChatList();
       selectChat(chat.id);
@@ -894,8 +1000,6 @@
   }
 
   // ---------------- Settings / profile (name + photo) ----------------
-  // Reads a chosen image file and downsizes it to a lightweight JPEG
-  // data URL. Used both for small profile photos and larger chat images.
   function readAndResizeImage(file, maxDim, quality){
     maxDim = maxDim || 160;
     quality = quality || 0.82;
@@ -924,11 +1028,6 @@
     });
   }
 
-  // The profile is written to localStorage (the durable, private copy)
-  // AND to the shared server store under profiles:<id>, so other open
-  // browsers can show your name/photo. If the server's storage ever
-  // gets wiped (a Render redeploy/restart), this browser is still the
-  // source of truth, so ensureProfileSynced() below quietly resends it.
   async function pushProfileToServer(profile){
     if(!profile) return false;
     return setData('profiles:'+profile.id, profile, true);
@@ -937,7 +1036,7 @@
   async function ensureProfileSynced(){
     if(!state.profile) return;
     const res = await getDataOrKeep('profiles:'+state.profile.id, true);
-    if(!res.changed) return; // offline/failed read — don't guess, try again later
+    if(!res.changed) return;
     const serverCopy = res.value;
     const matches = serverCopy
       && serverCopy.name === state.profile.name
@@ -1159,6 +1258,9 @@
     if(isSafeImageDataUrl(m.image, 1600000)){
       html += `<img class="msg-image" src="${m.image}" alt="">`;
     }
+    if(isSafeGifUrl(m.gif)){
+      html += `<img class="msg-image" src="${m.gif}" alt="GIF">`;
+    }
     if(m.text){
       html += `<div class="msg-text">${escapeHtml(m.text)}</div>`;
     }
@@ -1225,9 +1327,6 @@
     el.innerHTML = html || '';
     renderTypingBubble();
     if(wasNearBottom){ el.scrollTop = el.scrollHeight; }
-    // Progressively fetch any sender profiles (for their avatar) we
-    // haven't seen yet, then re-render once — never blocks the initial
-    // paint, which already falls back to colored initials.
     if(missingProfiles.size){
       Promise.all(Array.from(missingProfiles).map(async uid=>{
         const p = await getData('profiles:'+uid, true, null);
@@ -1303,7 +1402,7 @@
     state.replyingTo = {
       id: m.id,
       senderName: m.senderName,
-      preview: m.image ? ('📷 Photo' + (m.text ? ': '+m.text : '')) : (m.text && m.text.length>80 ? m.text.slice(0,80)+'…' : (m.text||''))
+      preview: m.image || m.gif ? ('📷 Photo' + (m.text ? ': '+m.text : '')) : (m.text && m.text.length>80 ? m.text.slice(0,80)+'…' : (m.text||''))
     };
     renderReplyBanner();
     document.getElementById('msg-input').focus();
@@ -1328,7 +1427,6 @@
     document.getElementById('image-preview-img').src = state.pendingImage;
     updateSendBtn();
   }
-  document.getElementById('attach-btn').onclick = ()=> document.getElementById('msg-image-input').click();
   document.getElementById('msg-image-input').addEventListener('change', async (e)=>{
     const file = e.target.files[0];
     if(!file) return;
@@ -1344,6 +1442,106 @@
     state.pendingImage = null;
     renderImagePreview();
   };
+
+  // ---------------- GIF picker ----------------
+  let gifListCache = null;
+  async function fetchGifList(){
+    if(gifListCache) return gifListCache;
+    try{
+      const res = await fetch(GIF_REPO_API);
+      if(!res.ok) throw new Error('failed to list gifs');
+      const data = await res.json();
+      const gifs = Array.isArray(data)
+        ? data.filter(f => f && f.type === 'file' && /\.gif$/i.test(f.name) && typeof f.download_url === 'string')
+            .map(f => ({ name: f.name, url: f.download_url }))
+        : [];
+      gifListCache = gifs;
+      return gifs;
+    }catch(e){
+      return [];
+    }
+  }
+
+  async function showAttachModal(){
+    openModal(`
+      <div class="modal" style="width:360px;">
+        <h2>Send a Photo or GIF</h2>
+        <button class="btn btn-secondary" type="button" id="attach-upload-btn" style="width:100%;margin-bottom:12px;">📷 Upload from device</button>
+        <div class="field-label" style="margin-top:0;">GIFs</div>
+        <div id="gif-grid" class="gif-grid"><div class="gif-grid-loading">Loading gifs…</div></div>
+        <div class="modal-actions">
+          <button class="btn btn-secondary" id="attach-cancel">Close</button>
+        </div>
+      </div>
+    `);
+    document.getElementById('attach-cancel').onclick = closeModal;
+    document.getElementById('attach-upload-btn').onclick = ()=>{
+      closeModal();
+      document.getElementById('msg-image-input').click();
+    };
+    const gifs = await fetchGifList();
+    const grid = document.getElementById('gif-grid');
+    if(!grid) return; // modal was closed while loading
+    if(gifs.length === 0){
+      grid.innerHTML = '<div class="gif-grid-empty">No GIFs found in the repo\'s /gifs folder.</div>';
+      return;
+    }
+    grid.innerHTML = gifs.map(g => `<div class="gif-thumb" data-url="${escapeHtml(g.url)}" title="${escapeHtml(g.name)}"><img src="${g.url}" alt="${escapeHtml(g.name)}" loading="lazy"></div>`).join('');
+    grid.querySelectorAll('.gif-thumb').forEach(el=>{
+      el.onclick = ()=>{
+        const url = el.getAttribute('data-url');
+        closeModal();
+        sendGifMessage(url);
+      };
+    });
+  }
+  document.getElementById('attach-btn').onclick = showAttachModal;
+
+  async function sendGifMessage(url){
+    if(!state.currentChatId || !isSafeGifUrl(url)) return;
+    const chatId = state.currentChatId;
+    const replyTo = state.replyingTo ? {
+      id: state.replyingTo.id,
+      senderName: state.replyingTo.senderName,
+      text: state.replyingTo.preview
+    } : null;
+    state.replyingTo = null;
+    renderReplyBanner();
+
+    const fresh = await getDataOrKeep('messages:'+chatId, true);
+    const msgs = fresh.changed ? fresh.value : (state.messagesCache[chatId] || []).slice();
+    const msg = {
+      id: genId(),
+      senderId: state.profile.id,
+      senderName: state.profile.name,
+      text: '',
+      image: null,
+      gif: url,
+      ts: Date.now(),
+      reactions: {},
+      replyTo
+    };
+    msgs.push(msg);
+    const saved = await setData('messages:'+chatId, msgs, true);
+    state.messagesCache[chatId] = msgs;
+    renderMessages(chatId);
+    const el = document.getElementById('messages-scroll');
+    el.scrollTop = el.scrollHeight;
+    if(!saved) showToast("GIF may not have saved — check your connection.");
+
+    const freshChats = await getDataOrKeep('chats', true);
+    const chats = freshChats.changed ? freshChats.value : state.chats;
+    const idx = chats.findIndex(c=>c.id===chatId);
+    if(idx>-1){
+      chats[idx].lastMessage = '🎞️ GIF';
+      chats[idx].lastSenderName = msg.senderName;
+      chats[idx].lastSenderId = msg.senderId;
+      chats[idx].lastMessageAt = msg.ts;
+      state.chats = chats;
+      await setData('chats', chats, true);
+      renderChatList();
+    }
+  }
 
   async function refreshMessages(chatId, forceScroll){
     const msgs = await getData('messages:'+chatId, true, []);
@@ -1377,9 +1575,6 @@
     renderReplyBanner();
     updateSendBtn();
 
-    // Read the freshest message list, falling back to our own cache
-    // (never to an empty array) if that read fails — otherwise a
-    // transient read error here would wipe the whole conversation.
     const fresh = await getDataOrKeep('messages:'+chatId, true);
     const msgs = fresh.changed ? fresh.value : (state.messagesCache[chatId] || []).slice();
     const msg = {
@@ -1388,6 +1583,7 @@
       senderName: state.profile.name,
       text,
       image: image || null,
+      gif: null,
       ts: Date.now(),
       reactions: {},
       replyTo
@@ -1400,7 +1596,6 @@
     el.scrollTop = el.scrollHeight;
     if(!saved) showToast("Message may not have saved — check your connection.");
 
-    // update chat metadata, same safe-fallback pattern
     const freshChats = await getDataOrKeep('chats', true);
     const chats = freshChats.changed ? freshChats.value : state.chats;
     const idx = chats.findIndex(c=>c.id===chatId);
@@ -1462,13 +1657,12 @@
         </div>
         <div style="height:1px;background:var(--border);margin:18px 0;"></div>
         <button class="btn btn-danger" id="info-delete" style="width:100%;">Delete Chat</button>
-        <div class="subtle-note">Passwords lock the chat behind a prompt in this app, but this isn't real encryption — treat it as a privacy convenience, not a secure vault. The same goes for direct messages: anyone with this app's link can still open any chat, DM or not, since there's no per-user login.</div>
+        <div class="subtle-note">Passwords lock the chat behind a prompt in this app, but this isn't real encryption — treat it as a privacy convenience, not a secure vault. The same goes for direct messages: anyone signed in with the access key can still open any chat, DM or not.</div>
       </div>
     `;
     document.getElementById('info-panel-close').onclick = toggleInfoPanel;
     const lockedBox = document.getElementById('info-locked');
     const pwFields = document.getElementById('info-pw-fields');
-    // if turning lock ON (from off), need new password
     lockedBox.onchange = ()=>{
       pwFields.style.display = (lockedBox.checked && !chat.locked) ? 'block' : 'none';
     };
@@ -1512,9 +1706,6 @@
   });
 
   // ---------------- Typing indicator ----------------
-  // Ephemeral, relayed live over the WebSocket — never written to the
-  // persisted store. Shows as a three-dot bubble at the end of the
-  // conversation, with the name(s) of whoever's typing above it.
   const typingUsers = new Map(); // senderId -> {name, timeoutId}
   let lastTypingSentAt = 0;
 
@@ -1558,7 +1749,7 @@
   function sendTypingSignal(){
     if(!state.currentChatId || !state.profile) return;
     const now = Date.now();
-    if(now - lastTypingSentAt < 1500) return; // throttle
+    if(now - lastTypingSentAt < 1500) return;
     lastTypingSentAt = now;
     if(ws && ws.readyState === WebSocket.OPEN){
       try{
@@ -1590,24 +1781,8 @@
     document.getElementById('main').classList.add('hidden');
   };
 
-  // ---------------- Presence ----------------
-  function sendIdentify(){
-    if(ws && ws.readyState === WebSocket.OPEN && state.profile){
-      try{
-        ws.send(JSON.stringify({type:'identify', id: state.profile.id, name: state.profile.name}));
-      }catch(e){}
-    }
-  }
-  function updateOnlineCountUI(){
-    const el = document.getElementById('online-count');
-    if(!el) return;
-    const n = state.onlineUserIds.size;
-    el.textContent = n > 0 ? (n + ' online') : '';
-  }
-
   // ---------------- Connection status + WebSocket ----------------
-  // red = disconnected, orange = connecting/reconnecting, green = connected.
-  function setConnStatus(status){ // 'connecting' | 'connected' | 'disconnected'
+  function setConnStatus(status){
     const dot = document.getElementById('conn-dot');
     if(!dot) return;
     dot.classList.remove('conn-connecting','conn-connected','conn-disconnected');
@@ -1625,7 +1800,7 @@
   function connectWS(){
     setConnStatus('connecting');
     try{
-      ws = new WebSocket(WS_URL);
+      ws = new WebSocket(WS_BASE_URL + '?key=' + encodeURIComponent(SITE_KEY_VALUE || ''));
     }catch(e){
       scheduleReconnect();
       return;
@@ -1634,17 +1809,21 @@
       setConnStatus('connected');
       wsReconnectDelay = 1000;
       sendIdentify();
-      syncAll(); // catch up on anything missed while disconnected
+      syncAll();
     };
     ws.onmessage = (evt)=>{
       let msg;
       try{ msg = JSON.parse(evt.data); }catch(e){ return; }
       handleWsMessage(msg);
     };
-    ws.onclose = ()=>{
+    ws.onclose = (evt)=>{
       setConnStatus('disconnected');
-      state.onlineUserIds = new Set();
+      state.onlineUsers = [];
       updateOnlineCountUI();
+      if(evt && evt.code === 4001){
+        handleUnauthorized();
+        return; // don't keep retrying with a bad key
+      }
       scheduleReconnect();
     };
     ws.onerror = ()=>{
@@ -1664,27 +1843,21 @@
   function handleWsMessage(msg){
     if(!msg || typeof msg.type !== 'string') return;
 
-    if(msg.type === 'hello'){
+    if(msg.type === 'hello' || msg.type === 'presence'){
       if(Array.isArray(msg.online)){
-        state.onlineUserIds = new Set(msg.online.map(u=>u.id));
+        state.onlineUsers = msg.online;
         updateOnlineCountUI();
-      }
-      return;
-    }
-
-    if(msg.type === 'presence'){
-      if(Array.isArray(msg.online)){
-        state.onlineUserIds = new Set(msg.online.map(u=>u.id));
-        updateOnlineCountUI();
-        renderChatList();
-        if(state.currentChatId) renderMessages(state.currentChatId);
+        if(msg.type === 'presence'){
+          renderChatList();
+          if(state.currentChatId) renderMessages(state.currentChatId);
+        }
       }
       return;
     }
 
     if(msg.type === 'typing'){
-      if(!state.profile || msg.senderId === state.profile.id) return; // ignore our own
-      if(msg.chatId !== state.currentChatId) return; // only care about the open chat
+      if(!state.profile || msg.senderId === state.profile.id) return;
+      if(msg.chatId !== state.currentChatId) return;
       const existing = typingUsers.get(msg.senderId);
       if(existing) clearTimeout(existing.timeoutId);
       const timeoutId = setTimeout(()=>{
@@ -1737,10 +1910,6 @@
     }
   }
 
-  // Best-effort resync, used right after a (re)connect and on a slow
-  // fallback timer in case a push was ever missed. Critical rule: a
-  // failed read must NEVER overwrite existing local state with an empty
-  // list — that was the bug that made chats "disappear" before.
   async function syncAll(){
     await ensureProfileSynced();
     const chatsRes = await getDataOrKeep('chats', true);
@@ -1763,7 +1932,6 @@
       }
     }
   }
-  // Realtime updates arrive over the WebSocket; this is just a safety net.
   setInterval(syncAll, 20000);
 
   // ---------------- Init ----------------
@@ -1787,12 +1955,6 @@
   }
 
   // ---------------- Access gate ----------------
-  // A lightweight client-side gate, not real security — the key lives in
-  // this file's source and localStorage can be edited directly, so treat
-  // it as a "keep casual visitors out" speed bump, not access control.
-  const SITE_KEY = '123456789';
-  const GATE_STORAGE_KEY = 'site_key_ok';
-
   function boot(){
     init();
     connectWS();
@@ -1807,28 +1969,42 @@
     const screen = document.getElementById('gate-screen');
     screen.style.display = 'flex';
     const input = document.getElementById('gate-key-input');
+    const submitBtn = document.getElementById('gate-submit');
     input.focus();
-    const attempt = ()=>{
-      if(input.value === SITE_KEY){
-        try{ localStorage.setItem(GATE_STORAGE_KEY, 'yes'); }catch(e){}
+    const attempt = async ()=>{
+      const val = input.value;
+      if(!val) return;
+      submitBtn.disabled = true;
+      document.getElementById('gate-error').textContent = '';
+      const ok = await verifyKeyWithServer(val);
+      submitBtn.disabled = false;
+      if(ok){
+        SITE_KEY_VALUE = val;
+        try{ localStorage.setItem(GATE_KEY_STORAGE, val); }catch(e){}
         unlockApp();
       }else{
-        document.getElementById('gate-error').textContent = 'Incorrect key.';
+        document.getElementById('gate-error').textContent = 'Incorrect key, or the server is unreachable — try again.';
         input.value = '';
         input.focus();
       }
     };
-    document.getElementById('gate-submit').onclick = attempt;
+    submitBtn.onclick = attempt;
     input.addEventListener('keydown', e=>{ if(e.key==='Enter') attempt(); });
   }
 
-  let gateOk = false;
-  try{ gateOk = localStorage.getItem(GATE_STORAGE_KEY) === 'yes'; }catch(e){}
-  if(gateOk){
-    unlockApp();
-  }else{
+  (async function(){
+    const stored = getStoredSiteKey();
+    if(stored){
+      const ok = await verifyKeyWithServer(stored);
+      if(ok){
+        SITE_KEY_VALUE = stored;
+        unlockApp();
+        return;
+      }
+      try{ localStorage.removeItem(GATE_KEY_STORAGE); }catch(e){}
+    }
     showGate();
-  }
+  })();
 
 })();
 </script>
