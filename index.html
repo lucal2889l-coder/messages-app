@@ -37,6 +37,23 @@
     border:1px solid var(--border);
   }
 
+  /* ---------- Access gate ---------- */
+  #gate-screen{
+    position:fixed;inset:0;
+    background:var(--sidebar-bg);
+    display:none;
+    align-items:center;justify-content:center;
+    z-index:1000;
+  }
+  #gate-box{
+    background:#fff;border-radius:16px;padding:28px;
+    width:300px;max-width:90%;
+    box-shadow:0 10px 40px rgba(0,0,0,0.15);
+    text-align:center;
+  }
+  #gate-box h2{margin:0 0 6px 0;font-size:17px;}
+  #gate-box .field-input{margin-top:10px;text-align:center;}
+
   /* ---------- Sidebar ---------- */
   #sidebar{
     width:300px;
@@ -57,7 +74,7 @@
   #sidebar-header-title{
     display:flex;
     align-items:center;
-    gap:8px;
+    gap:7px;
     min-width:0;
   }
   #sidebar-header h1{
@@ -76,21 +93,18 @@
   #conn-dot.conn-connecting{background:var(--warn);}
   #conn-dot.conn-connected{background:var(--ok);}
   #conn-dot.conn-disconnected{background:var(--danger);}
-  #compose-btn{
+  .online-count{font-size:11px;color:var(--text-dim);white-space:nowrap;}
+  #compose-btn, #settings-btn{
     width:30px;height:30px;border-radius:50%;
-    border:none;background:var(--blue);color:#fff;
-    font-size:16px;cursor:pointer;
+    border:none;color:#fff;
+    font-size:15px;cursor:pointer;
     display:flex;align-items:center;justify-content:center;
     flex-shrink:0;
+    transition:background-color .15s ease;
   }
+  #compose-btn{background:var(--blue);}
   #compose-btn:hover{background:var(--blue-dark);}
-  #settings-btn{
-    width:30px;height:30px;border-radius:50%;
-    border:none;background:#e5e5e7;color:var(--text);
-    font-size:14px;cursor:pointer;
-    display:flex;align-items:center;justify-content:center;
-    flex-shrink:0;
-  }
+  #settings-btn{background:#e5e5e7;color:var(--text);font-size:14px;}
   #settings-btn:hover{background:#d8d8da;}
   #search-wrap{padding:0 12px 10px 12px;}
   #search-input{
@@ -115,6 +129,7 @@
     border-radius:10px;
     cursor:pointer;
     margin-bottom:2px;
+    transition:background-color .15s ease;
   }
   .chat-row:hover{background:#eaeaec;}
   .chat-row.active{background:var(--blue);}
@@ -133,6 +148,11 @@
   .chat-time{font-size:12px;color:var(--text-dim);flex-shrink:0;}
   .chat-preview{font-size:13px;color:var(--text-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px;}
   .lock-icon{flex-shrink:0;opacity:0.7;}
+  .unread-badge{
+    background:var(--danger);color:#fff;font-size:11px;font-weight:700;
+    border-radius:10px;min-width:18px;height:18px;padding:0 5px;
+    display:flex;align-items:center;justify-content:center;flex-shrink:0;
+  }
   #empty-sidebar{
     padding:40px 20px;text-align:center;color:var(--text-dim);font-size:13.5px;line-height:1.5;
   }
@@ -175,7 +195,7 @@
     display:flex;
     flex-direction:column;
   }
-  .msg-row{display:flex;margin-bottom:4px;align-items:flex-end;}
+  .msg-row{display:flex;margin-bottom:6px;align-items:flex-end;}
   .msg-row.me{justify-content:flex-end;}
   .msg-row.them{justify-content:flex-start;}
   /* Bubble sizing: max-width lives on this wrapper (whose own width is
@@ -198,31 +218,82 @@
     border-radius:var(--radius-bubble);
     font-size:14.5px;
     line-height:1.35;
-    word-wrap:break-word;
-    overflow-wrap:break-word;
-    white-space:pre-wrap;
+    cursor:pointer;
+    box-shadow:0 1px 2px rgba(0,0,0,0.05);
   }
+  .msg-text{white-space:pre-wrap;word-wrap:break-word;overflow-wrap:break-word;}
+  .msg-image{
+    display:block;max-width:220px;max-height:260px;width:100%;height:auto;
+    border-radius:14px;object-fit:cover;
+  }
+  .msg-image + .msg-text{margin-top:6px;}
   .msg-row.me .bubble{background:var(--blue);color:#fff;border-bottom-right-radius:5px;}
   .msg-row.them .bubble{background:var(--bubble-in);color:var(--bubble-in-text);border-bottom-left-radius:5px;}
-  .msg-meta{font-size:11px;color:var(--text-dim);text-align:center;margin:12px 0 6px 0;}
+  .msg-meta{font-size:11px;color:var(--text-dim);text-align:center;margin:14px 0 6px 0;}
   .sender-label{font-size:11.5px;color:var(--text-dim);margin:2px 12px 2px 2px;}
   .msg-avatar{
     width:28px;height:28px;border-radius:50%;
     overflow:hidden;flex-shrink:0;margin-right:6px;
+    position:relative;
   }
   .msg-avatar img{width:100%;height:100%;object-fit:cover;display:block;}
-  .typing-bubble{display:flex;align-items:center;gap:4px;padding:11px 14px;}
-  .typing-dot{
-    width:6px;height:6px;border-radius:50%;
-    background:#9a9a9e;display:inline-block;
-    animation:typing-bounce 1.2s infinite ease-in-out;
+  .presence-dot{
+    position:absolute;width:9px;height:9px;border-radius:50%;
+    background:var(--ok);border:2px solid #fff;bottom:-1px;right:-1px;
   }
-  .typing-dot:nth-child(2){animation-delay:0.15s;}
-  .typing-dot:nth-child(3){animation-delay:0.3s;}
-  @keyframes typing-bounce{
-    0%,60%,100%{transform:translateY(0);opacity:0.5;}
-    30%{transform:translateY(-4px);opacity:1;}
+  .reply-preview{
+    border-left:3px solid var(--blue);
+    background:rgba(11,132,255,0.07);
+    border-radius:8px;
+    padding:4px 8px;margin-bottom:3px;
+    font-size:12px;max-width:100%;
   }
+  .reply-preview-name{font-weight:600;color:var(--blue);margin-right:4px;}
+  .reply-preview-text{color:var(--text-dim);}
+  .reactions-row{display:flex;flex-wrap:wrap;gap:4px;margin-top:3px;}
+  .msg-row.me .reactions-row{justify-content:flex-end;}
+  .reaction-pill{
+    background:#eef0f2;border-radius:12px;padding:2px 8px;
+    font-size:12px;cursor:pointer;user-select:none;
+    border:1px solid transparent;
+  }
+  .reaction-pill.mine{background:#dbeeff;border-color:var(--blue);}
+  .msg-detail{margin-top:4px;font-size:11.5px;color:var(--text-dim);}
+  .msg-detail-time{margin-bottom:4px;}
+  .msg-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
+  .msg-action-btn{
+    border:none;background:#eef0f2;border-radius:10px;
+    padding:3px 10px;font-size:12px;cursor:pointer;color:var(--text);
+  }
+  .quick-reacts{display:flex;gap:4px;font-size:15px;}
+  .quick-react-emoji{cursor:pointer;padding:2px;border-radius:6px;line-height:1;}
+  .quick-react-emoji:hover{background:#eef0f2;}
+  #typing-bubble-row .bubble{background:var(--bubble-in);}
+
+  #image-preview-wrap{padding:8px 14px 0 14px;display:none;}
+  #image-preview-inner{position:relative;display:inline-block;}
+  #image-preview-inner img{max-width:110px;max-height:110px;border-radius:10px;display:block;}
+  #image-preview-remove{
+    position:absolute;top:-6px;right:-6px;width:20px;height:20px;border-radius:50%;
+    border:none;background:#1c1c1e;color:#fff;font-size:11px;cursor:pointer;
+    display:flex;align-items:center;justify-content:center;
+  }
+  #reply-banner{
+    display:none;align-items:center;gap:8px;
+    padding:6px 14px;font-size:12.5px;color:var(--text-dim);
+    border-top:1px solid var(--border);background:#f6f6f7;
+  }
+  #reply-banner b{color:var(--text);}
+  #reply-banner-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  #reply-banner-cancel{
+    margin-left:auto;border:none;background:none;cursor:pointer;
+    color:var(--text-dim);font-size:14px;flex-shrink:0;
+  }
+  #attach-btn{
+    border:none;background:none;font-size:20px;cursor:pointer;
+    padding:4px 2px;flex-shrink:0;color:var(--text-dim);
+  }
+
   #composer{
     display:flex;
     align-items:flex-end;
@@ -242,8 +313,9 @@
     outline:none;
     font-family:inherit;
     line-height:1.35;
+    transition:border-color .15s ease, box-shadow .15s ease;
   }
-  #msg-input:focus{border-color:var(--blue);}
+  #msg-input:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(11,132,255,0.12);}
   #send-btn{
     width:32px;height:32px;border-radius:50%;
     border:none;background:var(--blue);color:#fff;
@@ -264,13 +336,17 @@
     background:rgba(0,0,0,0.28);
     display:flex;align-items:center;justify-content:center;
     z-index:50;
+    animation:fadeIn .15s ease;
   }
+  @keyframes fadeIn{from{opacity:0;}to{opacity:1;}}
   .modal{
     background:#fff;border-radius:14px;
     width:320px;max-width:90%;
     padding:20px;
     box-shadow:0 10px 40px rgba(0,0,0,0.2);
+    animation:modalPop .15s ease;
   }
+  @keyframes modalPop{from{opacity:0;transform:scale(0.97);}to{opacity:1;transform:scale(1);}}
   .modal h2{margin:0 0 14px 0;font-size:16px;font-weight:700;}
   .field-label{font-size:12.5px;color:var(--text-dim);margin:10px 0 4px 0;font-weight:500;}
   .field-input{
@@ -323,6 +399,19 @@
   }
   #toast.show{opacity:1;transform:translate(-50%, 0);pointer-events:auto;}
 
+  .typing-bubble{display:flex;align-items:center;gap:4px;padding:11px 14px;}
+  .typing-dot{
+    width:6px;height:6px;border-radius:50%;
+    background:#9a9a9e;display:inline-block;
+    animation:typing-bounce 1.2s infinite ease-in-out;
+  }
+  .typing-dot:nth-child(2){animation-delay:0.15s;}
+  .typing-dot:nth-child(3){animation-delay:0.3s;}
+  @keyframes typing-bounce{
+    0%,60%,100%{transform:translateY(0);opacity:0.5;}
+    30%{transform:translateY(-4px);opacity:1;}
+  }
+
   @media (max-width:680px){
     #sidebar{
       width:100%;max-width:none;
@@ -337,6 +426,18 @@
 </style>
 </head>
 <body>
+
+<div id="gate-screen">
+  <div id="gate-box">
+    <div style="font-size:32px;margin-bottom:8px;">🔒</div>
+    <h2>Enter Access Key</h2>
+    <div class="field-label" style="margin-top:0;">This app is private. Enter the key to continue.</div>
+    <input id="gate-key-input" class="field-input" type="password" autocomplete="off">
+    <div class="error-text" id="gate-error"></div>
+    <button class="btn btn-primary" id="gate-submit" style="width:100%;margin-top:12px;">Enter</button>
+  </div>
+</div>
+
 <div id="app">
 
   <div id="sidebar">
@@ -344,6 +445,7 @@
       <div id="sidebar-header-title">
         <h1>Messages</h1>
         <span id="conn-dot" class="conn-disconnected" title="Disconnected"></span>
+        <span id="online-count" class="online-count"></span>
       </div>
       <div style="display:flex;align-items:center;gap:8px;">
         <button id="settings-btn" title="Settings">⚙</button>
@@ -374,10 +476,24 @@
 
     <div id="messages-scroll" style="display:none;"></div>
 
+    <div id="image-preview-wrap">
+      <div id="image-preview-inner">
+        <img id="image-preview-img" src="" alt="">
+        <button id="image-preview-remove" title="Remove photo">✕</button>
+      </div>
+    </div>
+    <div id="reply-banner">
+      Replying to <b id="reply-banner-name"></b>:
+      <span id="reply-banner-text"></span>
+      <button id="reply-banner-cancel" title="Cancel reply">✕</button>
+    </div>
+
     <div id="composer" style="display:none;">
+      <button id="attach-btn" title="Attach photo">📷</button>
       <textarea id="msg-input" rows="1" placeholder="iMessage"></textarea>
       <button id="send-btn">↑</button>
     </div>
+    <input type="file" id="msg-image-input" accept="image/*" style="display:none;">
 
     <div id="info-panel" style="display:none;"></div>
   </div>
@@ -497,7 +613,6 @@
   }
 
   // ---------------- Toast ----------------
-  // A small transient message shown for non-fatal save/sync issues.
   function showToast(msg){
     let el = document.getElementById('toast');
     if(!el){
@@ -513,14 +628,22 @@
 
   // ---------------- App state ----------------
   const state = {
-    profile: null,          // {id, name}
+    profile: null,          // {id, name, avatar}
     chats: [],               // array of chat objects
     currentChatId: null,
     unlockedChatIds: new Set(), // session-only
     messagesCache: {},       // chatId -> array of messages
     profilesCache: {},       // senderId -> {id, name, avatar} | null
+    onlineUserIds: new Set(),
+    unreadCounts: {},        // chatId -> count (local only, resets on reload)
+    expandedMsgId: null,     // message currently showing its detail/actions row
+    replyingTo: null,        // {id, senderName, preview}
+    pendingImage: null,      // data URL of an attached-but-unsent photo
     searchTerm: ''
   };
+
+  const QUICK_REACT_EMOJIS = ['👍','❤️','😂','😮','😢','🙏'];
+  const BASE_TITLE = document.title;
 
   const AVATAR_COLORS = ['#ff9500','#ff3b30','#af52de','#5856d6','#007aff','#34c759','#ff2d55','#5ac8fa','#ffcc00'];
   function colorForName(name){
@@ -535,21 +658,26 @@
     return (parts[0][0]+parts[1][0]).toUpperCase();
   }
 
-  // Only ever render an avatar image if it's actually a well-formed
-  // image data URL — profiles are shared/writable by anyone with the
-  // server URL, so this avoids ever turning a crafted value into markup.
-  function isSafeAvatarDataUrl(url){
+  // Only ever render an <img> if the value is actually a well-formed
+  // image data URL — profiles/messages are shared/writable by anyone
+  // with the server URL, so this avoids ever turning a crafted string
+  // into markup.
+  function isSafeImageDataUrl(url, maxLen){
     return typeof url === 'string'
-      && url.length < 200000
+      && url.length < (maxLen || 200000)
       && /^data:image\/(png|jpe?g|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(url);
   }
 
-  function avatarHtml(profile, fallbackName){
-    if(profile && isSafeAvatarDataUrl(profile.avatar)){
-      return `<img src="${profile.avatar}" alt="">`;
+  function avatarHtml(profile, fallbackName, senderId){
+    let inner;
+    if(profile && isSafeImageDataUrl(profile.avatar, 200000)){
+      inner = `<img src="${profile.avatar}" alt="">`;
+    }else{
+      const name = (profile && profile.name) || fallbackName || '?';
+      inner = `<div class="avatar" style="width:100%;height:100%;font-size:12px;background:${colorForName(name)};">${initialsForName(name)}</div>`;
     }
-    const name = (profile && profile.name) || fallbackName || '?';
-    return `<div class="avatar" style="width:100%;height:100%;font-size:12px;background:${colorForName(name)};">${initialsForName(name)}</div>`;
+    const online = senderId && state.onlineUserIds.has(senderId);
+    return inner + (online ? '<span class="presence-dot" title="Online"></span>' : '');
   }
 
   function escapeHtml(str){
@@ -567,6 +695,49 @@
     if(now - d < oneWeek) return d.toLocaleDateString([], {weekday:'short'});
     return d.toLocaleDateString([], {month:'short', day:'numeric'});
   }
+
+  // ---------------- Unread badge + favicon ----------------
+  function totalUnread(){
+    return Object.values(state.unreadCounts).reduce((a,b)=>a+b,0);
+  }
+  function setFavicon(emoji){
+    let link = document.querySelector('link[rel="icon"]');
+    if(!link){
+      link = document.createElement('link');
+      link.rel = 'icon';
+      document.head.appendChild(link);
+    }
+    if(!emoji){ link.href = ''; return; }
+    try{
+      const canvas = document.createElement('canvas');
+      canvas.width = 64; canvas.height = 64;
+      const ctx = canvas.getContext('2d');
+      ctx.font = '54px serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(emoji, 32, 36);
+      link.href = canvas.toDataURL('image/png');
+    }catch(e){}
+  }
+  function updateUnreadUI(){
+    const total = totalUnread();
+    if(total > 0){
+      document.title = `(${total}) ${BASE_TITLE}`;
+      setFavicon('⚠️');
+    }else{
+      document.title = BASE_TITLE;
+      setFavicon(null);
+    }
+  }
+  document.addEventListener('visibilitychange', ()=>{
+    if(document.visibilityState === 'visible' && state.currentChatId){
+      if(state.unreadCounts[state.currentChatId]){
+        state.unreadCounts[state.currentChatId] = 0;
+        updateUnreadUI();
+        renderChatList();
+      }
+    }
+  });
 
   // ---------------- Modal system ----------------
   const modalRoot = document.getElementById('modal-root');
@@ -594,6 +765,7 @@
       await setData('profile', profile, false);
       state.profile = profile;
       pushProfileToServer(profile);
+      sendIdentify();
       closeModal();
       init();
     };
@@ -606,7 +778,11 @@
     openModal(`
       <div class="modal">
         <h2>New Chat</h2>
-        <div class="field-label">Chat name</div>
+        <div class="checkbox-row" style="margin-top:0;">
+          <input type="checkbox" id="new-chat-dm">
+          <label for="new-chat-dm">Direct message (just the two of you)</label>
+        </div>
+        <div class="field-label" id="new-chat-title-label">Chat name</div>
         <input id="new-chat-title" class="field-input" type="text" placeholder="e.g. Weekend Trip" maxlength="40" autofocus>
         <div class="checkbox-row">
           <input type="checkbox" id="new-chat-locked">
@@ -628,13 +804,25 @@
     const lockedBox = document.getElementById('new-chat-locked');
     const pwFields = document.getElementById('new-chat-pw-fields');
     lockedBox.onchange = ()=>{ pwFields.style.display = lockedBox.checked ? 'block' : 'none'; };
+    const dmBox = document.getElementById('new-chat-dm');
+    const titleLabel = document.getElementById('new-chat-title-label');
+    const titleInput = document.getElementById('new-chat-title');
+    dmBox.onchange = ()=>{
+      if(dmBox.checked){
+        titleLabel.textContent = "Who's this with?";
+        titleInput.placeholder = 'Their name';
+      }else{
+        titleLabel.textContent = 'Chat name';
+        titleInput.placeholder = 'e.g. Weekend Trip';
+      }
+    };
     document.getElementById('new-chat-cancel').onclick = closeModal;
-    document.getElementById('new-chat-title').focus();
+    titleInput.focus();
 
     document.getElementById('new-chat-create').onclick = async ()=>{
       const errEl = document.getElementById('new-chat-error');
-      const title = document.getElementById('new-chat-title').value.trim();
-      if(!title){ errEl.textContent = 'Please give the chat a name.'; return; }
+      const title = titleInput.value.trim();
+      if(!title){ errEl.textContent = dmBox.checked ? "Please enter who it's with." : 'Please give the chat a name.'; return; }
       let locked = lockedBox.checked;
       let passwordHash = null;
       if(locked){
@@ -647,6 +835,7 @@
       const chat = {
         id: genId(),
         title,
+        isDM: dmBox.checked,
         locked,
         passwordHash,
         createdAt: Date.now(),
@@ -705,10 +894,11 @@
   }
 
   // ---------------- Settings / profile (name + photo) ----------------
-  // Reads a chosen image file and downsizes it to a small square-ish
-  // JPEG data URL, so profile photos stay lightweight wherever they're
-  // stored and sent.
-  function readAndResizeImage(file){
+  // Reads a chosen image file and downsizes it to a lightweight JPEG
+  // data URL. Used both for small profile photos and larger chat images.
+  function readAndResizeImage(file, maxDim, quality){
+    maxDim = maxDim || 160;
+    quality = quality || 0.82;
     return new Promise((resolve, reject)=>{
       const reader = new FileReader();
       reader.onerror = ()=> reject(new Error('read failed'));
@@ -716,7 +906,6 @@
         const img = new Image();
         img.onerror = ()=> reject(new Error('decode failed'));
         img.onload = ()=>{
-          const maxDim = 160;
           let width = img.naturalWidth, height = img.naturalHeight;
           if(width > height){
             if(width > maxDim){ height = Math.round(height * (maxDim/width)); width = maxDim; }
@@ -727,7 +916,7 @@
           canvas.width = width; canvas.height = height;
           const ctx = canvas.getContext('2d');
           ctx.drawImage(img, 0, 0, width, height);
-          resolve(canvas.toDataURL('image/jpeg', 0.82));
+          resolve(canvas.toDataURL('image/jpeg', quality));
         };
         img.src = reader.result;
       };
@@ -766,11 +955,11 @@
         <h2>Your Profile</h2>
         <div style="display:flex;align-items:center;gap:14px;margin-bottom:4px;">
           <div class="avatar" id="settings-avatar-preview" style="width:56px;height:56px;font-size:20px;background:${colorForName(currentName || '?')}">
-            ${isSafeAvatarDataUrl(currentAvatar) ? `<img src="${currentAvatar}" alt="" style="width:100%;height:100%;border-radius:50%;object-fit:cover;">` : initialsForName(currentName || '?')}
+            ${isSafeImageDataUrl(currentAvatar, 200000) ? `<img src="${currentAvatar}" alt="" style="width:100%;height:100%;border-radius:50%;object-fit:cover;">` : initialsForName(currentName || '?')}
           </div>
           <div>
             <button class="btn btn-secondary" type="button" id="settings-upload-btn">Upload photo</button>
-            <div id="settings-remove-wrap" style="margin-top:6px;${isSafeAvatarDataUrl(currentAvatar) ? '' : 'display:none;'}">
+            <div id="settings-remove-wrap" style="margin-top:6px;${isSafeImageDataUrl(currentAvatar, 200000) ? '' : 'display:none;'}">
               <button class="btn btn-secondary" type="button" id="settings-remove-btn" style="font-size:12px;padding:4px 10px;">Remove photo</button>
             </div>
           </div>
@@ -786,7 +975,7 @@
       </div>
     `);
 
-    let pendingAvatar = isSafeAvatarDataUrl(currentAvatar) ? currentAvatar : null;
+    let pendingAvatar = isSafeImageDataUrl(currentAvatar, 200000) ? currentAvatar : null;
     let avatarRemoved = false;
 
     const preview = document.getElementById('settings-avatar-preview');
@@ -812,7 +1001,7 @@
       const errEl = document.getElementById('settings-error');
       errEl.textContent = '';
       try{
-        pendingAvatar = await readAndResizeImage(file);
+        pendingAvatar = await readAndResizeImage(file, 160, 0.82);
         avatarRemoved = false;
         updatePreview();
       }catch(err){
@@ -840,6 +1029,7 @@
       state.profile = profile;
       await setData('profile', profile, false);
       const ok = await pushProfileToServer(profile);
+      sendIdentify();
       closeModal();
       renderChatList();
       if(state.currentChatId) renderMessages(state.currentChatId);
@@ -889,13 +1079,17 @@
       if(state.profile && c.lastSenderId === state.profile.id) previewName = 'You';
       const preview = c.locked && !unlocked ? 'Locked chat' : (c.lastMessage ? (previewName ? escapeHtml(previewName)+': '+escapeHtml(c.lastMessage) : escapeHtml(c.lastMessage)) : 'No messages yet');
       const active = c.id === state.currentChatId ? 'active' : '';
+      const unread = state.unreadCounts[c.id] || 0;
       return `
         <div class="chat-row ${active}" data-id="${c.id}">
           <div class="avatar" style="background:${colorForName(c.title)}">${initialsForName(c.title)}</div>
           <div class="chat-row-main">
             <div class="chat-row-top">
-              <div class="chat-title">${c.locked ? '<span class="lock-icon">🔒</span>' : ''}${escapeHtml(c.title)}</div>
-              <div class="chat-time">${fmtTime(c.lastMessageAt)}</div>
+              <div class="chat-title">${c.locked ? '<span class="lock-icon">🔒</span>' : ''}${c.isDM ? '<span class="lock-icon" title="Direct message">👤</span>' : ''}${escapeHtml(c.title)}</div>
+              <div style="display:flex;align-items:center;gap:6px;flex-shrink:0;">
+                <div class="chat-time">${fmtTime(c.lastMessageAt)}</div>
+                ${unread > 0 ? `<span class="unread-badge">${unread > 99 ? '99+' : unread}</span>` : ''}
+              </div>
             </div>
             <div class="chat-preview">${preview}</div>
           </div>
@@ -929,6 +1123,13 @@
   async function openChat(chatId){
     clearTypingUsers();
     state.currentChatId = chatId;
+    state.expandedMsgId = null;
+    state.replyingTo = null;
+    state.pendingImage = null;
+    renderReplyBanner();
+    renderImagePreview();
+    state.unreadCounts[chatId] = 0;
+    updateUnreadUI();
     document.getElementById('info-panel').style.display = 'none';
     if(window.innerWidth <= 680){
       document.getElementById('sidebar').classList.add('hidden');
@@ -950,7 +1151,47 @@
     document.getElementById('conv-avatar').style.background = colorForName(chat.title);
     document.getElementById('conv-avatar').textContent = initialsForName(chat.title);
     document.getElementById('conv-title').innerHTML = (chat.locked ? '🔒 ' : '') + escapeHtml(chat.title);
-    document.getElementById('conv-sub').textContent = '';
+    document.getElementById('conv-sub').textContent = chat.isDM ? 'Direct message' : '';
+  }
+
+  function bubbleContentHtml(m){
+    let html = '';
+    if(isSafeImageDataUrl(m.image, 1600000)){
+      html += `<img class="msg-image" src="${m.image}" alt="">`;
+    }
+    if(m.text){
+      html += `<div class="msg-text">${escapeHtml(m.text)}</div>`;
+    }
+    return html;
+  }
+
+  function replyPreviewHtml(m){
+    if(!m.replyTo) return '';
+    return `<div class="reply-preview"><span class="reply-preview-name">${escapeHtml(m.replyTo.senderName||'')}</span><span class="reply-preview-text">${escapeHtml(m.replyTo.text||'')}</span></div>`;
+  }
+
+  function reactionsHtml(m){
+    if(!m.reactions) return '';
+    const keys = Object.keys(m.reactions).filter(k => m.reactions[k] && m.reactions[k].length);
+    if(!keys.length) return '';
+    return `<div class="reactions-row">` + keys.map(emoji=>{
+      const count = m.reactions[emoji].length;
+      const mine = state.profile && m.reactions[emoji].includes(state.profile.id);
+      return `<span class="reaction-pill${mine?' mine':''}" data-emoji="${escapeHtml(emoji)}" data-msg-id="${m.id}">${emoji} ${count}</span>`;
+    }).join('') + `</div>`;
+  }
+
+  function msgDetailHtml(m){
+    const timeStr = new Date(m.ts).toLocaleString([], {hour:'numeric', minute:'2-digit', month:'short', day:'numeric'});
+    return `<div class="msg-detail">
+      <div class="msg-detail-time">${escapeHtml(m.senderName)} · ${timeStr}</div>
+      <div class="msg-actions">
+        <button class="msg-action-btn msg-action-reply" data-msg-id="${m.id}">Reply</button>
+        <span class="quick-reacts" data-msg-id="${m.id}">
+          ${QUICK_REACT_EMOJIS.map(e=>`<span class="quick-react-emoji" data-emoji="${e}">${e}</span>`).join('')}
+        </span>
+      </div>
+    </div>`;
   }
 
   function renderMessages(chatId){
@@ -967,15 +1208,18 @@
         lastDay = day;
       }
       const mine = m.senderId === state.profile.id;
-      html += `<div class="msg-row ${mine?'me':'them'}">`;
+      html += `<div class="msg-row ${mine?'me':'them'}" data-msg-id="${m.id}">`;
       if(!mine){
         const prof = state.profilesCache[m.senderId];
         if(prof === undefined) missingProfiles.add(m.senderId);
-        html += `<div class="msg-avatar">${avatarHtml(prof, m.senderName)}</div>`;
+        html += `<div class="msg-avatar">${avatarHtml(prof, m.senderName, m.senderId)}</div>`;
       }
       html += `<div class="bubble-group">`;
       if(!mine) html += `<div class="sender-label">${escapeHtml(m.senderName)}</div>`;
-      html += `<div class="bubble">${escapeHtml(m.text)}</div>`;
+      html += replyPreviewHtml(m);
+      html += `<div class="bubble" data-msg-id="${m.id}">${bubbleContentHtml(m)}</div>`;
+      html += reactionsHtml(m);
+      if(state.expandedMsgId === m.id) html += msgDetailHtml(m);
       html += `</div></div>`;
     });
     el.innerHTML = html || '';
@@ -994,6 +1238,113 @@
     }
   }
 
+  document.getElementById('messages-scroll').addEventListener('click', (e)=>{
+    const reactEmoji = e.target.closest('.quick-react-emoji');
+    if(reactEmoji){
+      const msgId = reactEmoji.closest('.quick-reacts').dataset.msgId;
+      const emoji = reactEmoji.dataset.emoji;
+      if(state.currentChatId && state.profile){
+        updateMessage(state.currentChatId, msgId, toggleReactionMutator(emoji, state.profile.id));
+      }
+      return;
+    }
+    const pill = e.target.closest('.reaction-pill');
+    if(pill){
+      const msgId = pill.dataset.msgId;
+      const emoji = pill.dataset.emoji;
+      if(state.currentChatId && state.profile){
+        updateMessage(state.currentChatId, msgId, toggleReactionMutator(emoji, state.profile.id));
+      }
+      return;
+    }
+    const replyBtn = e.target.closest('.msg-action-reply');
+    if(replyBtn){
+      const msgId = replyBtn.dataset.msgId;
+      const msgs = state.messagesCache[state.currentChatId] || [];
+      const m = msgs.find(x=>x.id===msgId);
+      if(m) startReply(m);
+      state.expandedMsgId = null;
+      renderMessages(state.currentChatId);
+      return;
+    }
+    const bubble = e.target.closest('.bubble');
+    if(bubble && bubble.dataset.msgId){
+      const msgId = bubble.dataset.msgId;
+      state.expandedMsgId = (state.expandedMsgId === msgId) ? null : msgId;
+      renderMessages(state.currentChatId);
+    }
+  });
+
+  async function updateMessage(chatId, msgId, mutator){
+    const fresh = await getDataOrKeep('messages:'+chatId, true);
+    const msgs = fresh.changed ? fresh.value : (state.messagesCache[chatId] || []).slice();
+    const idx = msgs.findIndex(m => m.id === msgId);
+    if(idx === -1) return false;
+    mutator(msgs[idx]);
+    state.messagesCache[chatId] = msgs;
+    renderMessages(chatId);
+    const ok = await setData('messages:'+chatId, msgs, true);
+    if(!ok) showToast("Couldn't sync that change — check your connection.");
+    return ok;
+  }
+
+  function toggleReactionMutator(emoji, userId){
+    return (msg)=>{
+      if(!msg.reactions) msg.reactions = {};
+      const arr = msg.reactions[emoji] || [];
+      const i = arr.indexOf(userId);
+      if(i === -1) arr.push(userId); else arr.splice(i,1);
+      if(arr.length === 0) delete msg.reactions[emoji];
+      else msg.reactions[emoji] = arr;
+    };
+  }
+
+  function startReply(m){
+    state.replyingTo = {
+      id: m.id,
+      senderName: m.senderName,
+      preview: m.image ? ('📷 Photo' + (m.text ? ': '+m.text : '')) : (m.text && m.text.length>80 ? m.text.slice(0,80)+'…' : (m.text||''))
+    };
+    renderReplyBanner();
+    document.getElementById('msg-input').focus();
+  }
+
+  function renderReplyBanner(){
+    const el = document.getElementById('reply-banner');
+    if(!state.replyingTo){ el.style.display = 'none'; return; }
+    el.style.display = 'flex';
+    document.getElementById('reply-banner-name').textContent = state.replyingTo.senderName;
+    document.getElementById('reply-banner-text').textContent = state.replyingTo.preview;
+  }
+  document.getElementById('reply-banner-cancel').onclick = ()=>{
+    state.replyingTo = null;
+    renderReplyBanner();
+  };
+
+  function renderImagePreview(){
+    const wrap = document.getElementById('image-preview-wrap');
+    if(!state.pendingImage){ wrap.style.display = 'none'; updateSendBtn(); return; }
+    wrap.style.display = 'block';
+    document.getElementById('image-preview-img').src = state.pendingImage;
+    updateSendBtn();
+  }
+  document.getElementById('attach-btn').onclick = ()=> document.getElementById('msg-image-input').click();
+  document.getElementById('msg-image-input').addEventListener('change', async (e)=>{
+    const file = e.target.files[0];
+    if(!file) return;
+    try{
+      state.pendingImage = await readAndResizeImage(file, 800, 0.75);
+      renderImagePreview();
+    }catch(err){
+      showToast("Couldn't read that image.");
+    }
+    e.target.value = '';
+  });
+  document.getElementById('image-preview-remove').onclick = ()=>{
+    state.pendingImage = null;
+    renderImagePreview();
+  };
+
   async function refreshMessages(chatId, forceScroll){
     const msgs = await getData('messages:'+chatId, true, []);
     state.messagesCache[chatId] = msgs;
@@ -1010,10 +1361,20 @@
   async function sendMessage(){
     const input = document.getElementById('msg-input');
     const text = input.value.trim();
-    if(!text || !state.currentChatId) return;
+    const image = state.pendingImage;
+    if((!text && !image) || !state.currentChatId) return;
     const chatId = state.currentChatId;
+    const replyTo = state.replyingTo ? {
+      id: state.replyingTo.id,
+      senderName: state.replyingTo.senderName,
+      text: state.replyingTo.preview
+    } : null;
     input.value = '';
     autosizeInput(input);
+    state.pendingImage = null;
+    state.replyingTo = null;
+    renderImagePreview();
+    renderReplyBanner();
     updateSendBtn();
 
     // Read the freshest message list, falling back to our own cache
@@ -1026,7 +1387,10 @@
       senderId: state.profile.id,
       senderName: state.profile.name,
       text,
-      ts: Date.now()
+      image: image || null,
+      ts: Date.now(),
+      reactions: {},
+      replyTo
     };
     msgs.push(msg);
     const saved = await setData('messages:'+chatId, msgs, true);
@@ -1041,7 +1405,7 @@
     const chats = freshChats.changed ? freshChats.value : state.chats;
     const idx = chats.findIndex(c=>c.id===chatId);
     if(idx>-1){
-      chats[idx].lastMessage = text;
+      chats[idx].lastMessage = image ? (text ? '📷 '+text : '📷 Photo') : text;
       chats[idx].lastSenderName = msg.senderName;
       chats[idx].lastSenderId = msg.senderId;
       chats[idx].lastMessageAt = msg.ts;
@@ -1057,7 +1421,7 @@
   }
   function updateSendBtn(){
     const input = document.getElementById('msg-input');
-    document.getElementById('send-btn').disabled = input.value.trim().length===0;
+    document.getElementById('send-btn').disabled = input.value.trim().length===0 && !state.pendingImage;
   }
 
   // ---------------- Info panel ----------------
@@ -1098,7 +1462,7 @@
         </div>
         <div style="height:1px;background:var(--border);margin:18px 0;"></div>
         <button class="btn btn-danger" id="info-delete" style="width:100%;">Delete Chat</button>
-        <div class="subtle-note">Passwords lock the chat behind a prompt in this app, but this isn't real encryption — treat it as a privacy convenience, not a secure vault.</div>
+        <div class="subtle-note">Passwords lock the chat behind a prompt in this app, but this isn't real encryption — treat it as a privacy convenience, not a secure vault. The same goes for direct messages: anyone with this app's link can still open any chat, DM or not, since there's no per-user login.</div>
       </div>
     `;
     document.getElementById('info-panel-close').onclick = toggleInfoPanel;
@@ -1150,8 +1514,7 @@
   // ---------------- Typing indicator ----------------
   // Ephemeral, relayed live over the WebSocket — never written to the
   // persisted store. Shows as a three-dot bubble at the end of the
-  // conversation, like a normal incoming message, with the name(s)
-  // of whoever's typing above it.
+  // conversation, with the name(s) of whoever's typing above it.
   const typingUsers = new Map(); // senderId -> {name, timeoutId}
   let lastTypingSentAt = 0;
 
@@ -1182,7 +1545,7 @@
     }
     const prof = state.profilesCache[entries[0][0]];
     bubble.innerHTML = `
-      <div class="msg-avatar">${avatarHtml(prof, names[0])}</div>
+      <div class="msg-avatar">${avatarHtml(prof, names[0], entries[0][0])}</div>
       <div class="bubble-group">
         <div class="sender-label">${escapeHtml(label)}</div>
         <div class="bubble typing-bubble"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></div>
@@ -1227,6 +1590,21 @@
     document.getElementById('main').classList.add('hidden');
   };
 
+  // ---------------- Presence ----------------
+  function sendIdentify(){
+    if(ws && ws.readyState === WebSocket.OPEN && state.profile){
+      try{
+        ws.send(JSON.stringify({type:'identify', id: state.profile.id, name: state.profile.name}));
+      }catch(e){}
+    }
+  }
+  function updateOnlineCountUI(){
+    const el = document.getElementById('online-count');
+    if(!el) return;
+    const n = state.onlineUserIds.size;
+    el.textContent = n > 0 ? (n + ' online') : '';
+  }
+
   // ---------------- Connection status + WebSocket ----------------
   // red = disconnected, orange = connecting/reconnecting, green = connected.
   function setConnStatus(status){ // 'connecting' | 'connected' | 'disconnected'
@@ -1255,6 +1633,7 @@
     ws.onopen = ()=>{
       setConnStatus('connected');
       wsReconnectDelay = 1000;
+      sendIdentify();
       syncAll(); // catch up on anything missed while disconnected
     };
     ws.onmessage = (evt)=>{
@@ -1264,6 +1643,8 @@
     };
     ws.onclose = ()=>{
       setConnStatus('disconnected');
+      state.onlineUserIds = new Set();
+      updateOnlineCountUI();
       scheduleReconnect();
     };
     ws.onerror = ()=>{
@@ -1282,6 +1663,24 @@
 
   function handleWsMessage(msg){
     if(!msg || typeof msg.type !== 'string') return;
+
+    if(msg.type === 'hello'){
+      if(Array.isArray(msg.online)){
+        state.onlineUserIds = new Set(msg.online.map(u=>u.id));
+        updateOnlineCountUI();
+      }
+      return;
+    }
+
+    if(msg.type === 'presence'){
+      if(Array.isArray(msg.online)){
+        state.onlineUserIds = new Set(msg.online.map(u=>u.id));
+        updateOnlineCountUI();
+        renderChatList();
+        if(state.currentChatId) renderMessages(state.currentChatId);
+      }
+      return;
+    }
 
     if(msg.type === 'typing'){
       if(!state.profile || msg.senderId === state.profile.id) return; // ignore our own
@@ -1315,8 +1714,20 @@
     }else if(msg.key.indexOf('messages:')===0){
       const chatId = msg.key.slice('messages:'.length);
       if(Array.isArray(msg.value)){
+        const prevMsgs = state.messagesCache[chatId] || [];
+        const prevIds = new Set(prevMsgs.map(m=>m.id));
+        const newOnes = msg.value.filter(m => !prevIds.has(m.id));
         state.messagesCache[chatId] = msg.value;
         if(chatId === state.currentChatId) renderMessages(chatId);
+        const isActivelyViewing = chatId === state.currentChatId && document.visibilityState === 'visible';
+        if(!isActivelyViewing){
+          const fromOthers = newOnes.filter(m => !state.profile || m.senderId !== state.profile.id);
+          if(fromOthers.length){
+            state.unreadCounts[chatId] = (state.unreadCounts[chatId] || 0) + fromOthers.length;
+            updateUnreadUI();
+            renderChatList();
+          }
+        }
       }
     }else if(msg.key.indexOf('profiles:')===0){
       const uid = msg.key.slice('profiles:'.length);
@@ -1365,16 +1776,59 @@
       }
       state.profile = profile;
     }
+    sendIdentify();
     state.chats = await getData('chats', true, []);
     renderChatList();
     updateSendBtn();
+    updateUnreadUI();
     if(window.innerWidth <= 680){
       document.getElementById('main').classList.add('hidden');
     }
   }
 
-  init();
-  connectWS();
+  // ---------------- Access gate ----------------
+  // A lightweight client-side gate, not real security — the key lives in
+  // this file's source and localStorage can be edited directly, so treat
+  // it as a "keep casual visitors out" speed bump, not access control.
+  const SITE_KEY = '123456789';
+  const GATE_STORAGE_KEY = 'site_key_ok';
+
+  function boot(){
+    init();
+    connectWS();
+  }
+
+  function unlockApp(){
+    document.getElementById('gate-screen').style.display = 'none';
+    boot();
+  }
+
+  function showGate(){
+    const screen = document.getElementById('gate-screen');
+    screen.style.display = 'flex';
+    const input = document.getElementById('gate-key-input');
+    input.focus();
+    const attempt = ()=>{
+      if(input.value === SITE_KEY){
+        try{ localStorage.setItem(GATE_STORAGE_KEY, 'yes'); }catch(e){}
+        unlockApp();
+      }else{
+        document.getElementById('gate-error').textContent = 'Incorrect key.';
+        input.value = '';
+        input.focus();
+      }
+    };
+    document.getElementById('gate-submit').onclick = attempt;
+    input.addEventListener('keydown', e=>{ if(e.key==='Enter') attempt(); });
+  }
+
+  let gateOk = false;
+  try{ gateOk = localStorage.getItem(GATE_STORAGE_KEY) === 'yes'; }catch(e){}
+  if(gateOk){
+    unlockApp();
+  }else{
+    showGate();
+  }
 
 })();
 </script>
