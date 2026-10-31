@@ -622,10 +622,11 @@
 
   // ---------------- Storage ----------------
   // Private profile data stays in this browser.
-  // Shared chats/messages live on the Render server. This page is hosted
-  // statically on GitHub Pages, so it talks to that server over its full
-  // URL (both plain HTTPS calls and a WebSocket), not relative paths.
-  const SERVER_ORIGIN = 'https://messages-server-waf1.onrender.com';
+  // Shared chats/messages live on the backend server (self-hosted, with a
+  // persistent volume so data survives restarts/redeploys). This page is
+  // hosted statically on GitHub Pages, so it talks to that server over its
+  // full URL (both plain HTTPS calls and a WebSocket), not relative paths.
+  const SERVER_ORIGIN = 'https://messages.zdstudios.network';
   const API_BASE = SERVER_ORIGIN + '/api/data/';
   const WS_BASE_URL = SERVER_ORIGIN.replace(/^http/, 'ws') + '/ws';
   const GIF_REPO_API = 'https://api.github.com/repos/lucal2889l-coder/messages-app/contents/gifs';

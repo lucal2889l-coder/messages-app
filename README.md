@@ -1,6 +1,6 @@
 # Messages
 
-A simple private chat app. The frontend (`index.html`) runs on GitHub Pages; the backend (`server.js`) runs on Render and handles storage, real-time updates, and access control.
+A simple private chat app. The frontend (`index.html`) runs on GitHub Pages; the backend (`server.js`) handles storage, real-time updates, and access control. The live deployment runs self-hosted (Docker/Coolify) with a persistent volume, so chat data survives restarts and redeploys — see the Render notes below if you'd rather run your own copy there instead.
 
 ## Features
 
@@ -13,11 +13,17 @@ A simple private chat app. The frontend (`index.html`) runs on GitHub Pages; the
 
 ## Setup
 
-1. **Backend (Render):** deploy this repo as a Render web service (`npm install` / `npm start`). Set an environment variable `SITE_KEY` to whatever access key you want — if unset, it defaults to `123456789`.
-2. **Frontend (GitHub Pages):** enable Pages on this repo (Settings → Pages → Deploy from branch → `main` / root). In `index.html`, set `SERVER_ORIGIN` near the top of the script to your Render URL.
+1. **Backend (self-hosted / Docker / Coolify):** `npm install` / `npm start`, or build from source with any Node 20+ buildpack (no Dockerfile needed — Nixpacks auto-detects it from `package.json`). Environment variables:
+   - `SITE_KEY` — the shared access key. If unset, it defaults to the insecure `123456789`; always set your own.
+   - `DATA_DIR` — a writable directory for `data.json` to live in. Point this at a mounted persistent volume (e.g. `/data`) so chat data survives container restarts/redeploys. Defaults to the app folder if unset.
+   - `PORT` — defaults to `3000`.
+2. **Frontend (GitHub Pages):** enable Pages on this repo (Settings → Pages → Deploy from branch → `main` / root). In `index.html`, set `SERVER_ORIGIN` near the top of the script to your backend's URL.
 3. **GIFs:** add `.gif` files to a `gifs/` folder in this repo — they'll show up automatically in the GIF picker.
+
+### Render (alternative)
+
+Still supported via `render.yaml` (`npm install` / `npm start`, same `SITE_KEY` env var). Render's free plan has no persistent disk, so leave `DATA_DIR` unset there — chat data will be wiped on every redeploy/restart/idle-spindown regardless, which is why the live deployment has moved off it.
 
 ## Notes
 
-- Render's free plan has no persistent disk, so chat data is wiped on redeploy/restart.
 - The access key is enforced server-side, but it's a single shared key with no rate-limiting — enough to keep out casual visitors, not a determined attacker.
