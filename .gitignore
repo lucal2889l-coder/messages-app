@@ -1,2 +1,8 @@
 node_modules/
 .env
+# runtime data (when DATA_DIR isn't set it lives in the app folder)
+data.json
+data.json.tmp
+data.*.json
+data.json.corrupt-*
+uploads/
