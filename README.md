@@ -1,6 +1,6 @@
 # Messages
 
-A simple private chat app. The frontend (`index.html`) runs on GitHub Pages; the backend (`server.js`) handles storage, real-time updates, and access control. The live deployment runs self-hosted (Docker/Coolify) with a persistent volume, so chat data survives restarts and redeploys — see the Render notes below if you'd rather run your own copy there instead.
+A simple private chat app. The frontend (`index.html`) runs on GitHub Pages; the backend (`server.js`) handles storage, real-time updates, and access control. The live deployment runs self-hosted (Docker/Coolify) with a persistent volume, so chat data survives restarts and redeploys.
 
 ## Features
 
@@ -19,10 +19,6 @@ A simple private chat app. The frontend (`index.html`) runs on GitHub Pages; the
    - `PORT` — defaults to `3000`.
 2. **Frontend (GitHub Pages):** enable Pages on this repo (Settings → Pages → Deploy from branch → `main` / root). In `index.html`, set `SERVER_ORIGIN` near the top of the script to your backend's URL.
 3. **GIFs:** add `.gif` files to a `gifs/` folder in this repo — they'll show up automatically in the GIF picker.
-
-### Render (alternative)
-
-Still supported via `render.yaml` (`npm install` / `npm start`, same `SITE_KEY` env var). Render's free plan has no persistent disk, so leave `DATA_DIR` unset there — chat data will be wiped on every redeploy/restart/idle-spindown regardless, which is why the live deployment has moved off it.
 
 ## Notes
 
