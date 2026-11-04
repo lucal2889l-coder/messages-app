@@ -105,23 +105,26 @@ export async function copyText(text) {
 }
 
 // Resize an image file to a JPEG/PNG data blob (used for avatars + icons).
-export function resizeImage(file, maxDim = 256, quality = 0.88) {
+export function resizeImage(file, maxDim = 256, quality = 0.88, aspect = 1) {
   return new Promise((resolve, reject) => {
     const url = URL.createObjectURL(file);
     const img = new Image();
     img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('decode failed')); };
     img.onload = () => {
       URL.revokeObjectURL(url);
-      // Square-crop from the centre — avatars and icons are round anyway.
-      const side = Math.min(img.naturalWidth, img.naturalHeight);
-      const sx = (img.naturalWidth - side) / 2;
-      const sy = (img.naturalHeight - side) / 2;
-      const out = Math.min(maxDim, side);
+      // Crop from the centre to the wanted shape: square for avatars and icons,
+      // wide for profile banners.
+      const srcW = Math.min(img.naturalWidth, img.naturalHeight * aspect);
+      const srcH = srcW / aspect;
+      const sx = (img.naturalWidth - srcW) / 2;
+      const sy = (img.naturalHeight - srcH) / 2;
+      const outW = Math.round(Math.min(maxDim, srcW));
+      const outH = Math.round(outW / aspect);
       const canvas = document.createElement('canvas');
-      canvas.width = out; canvas.height = out;
+      canvas.width = outW; canvas.height = outH;
       const ctx = canvas.getContext('2d');
       ctx.imageSmoothingQuality = 'high';
-      ctx.drawImage(img, sx, sy, side, side, 0, 0, out, out);
+      ctx.drawImage(img, sx, sy, srcW, srcH, 0, 0, outW, outH);
       canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('encode failed'))), 'image/jpeg', quality);
     };
     img.src = url;

@@ -1,12 +1,17 @@
 // Settings screens + group management + "new" dialogs + quick switcher.
-import { $, $$, esc, fmtSize, sha256Hex, copyText, resizeImage } from './util.js';
-import { api, session, uploadFile, mediaUrl } from './api.js';
+import { $, $$, esc, fmtSize, sha256Hex, resizeImage } from './util.js';
+import { api, uploadFile, mediaUrl } from './api.js';
 import {
-  state, prefs, savePrefs, actions, applyAppearance, THEMES, avatarHtml, chatIconHtml, bannerColor,
+  state, prefs, savePrefs, actions, applyAppearance, THEMES, avatarHtml, nameHtml, badgesHtml, chatIconHtml, bannerStyle,
   STATUS_LABEL, chatName, getUser, statusOf
 } from './store.js';
-import { toast, openModal, confirmDialog, registerLayer, memberPickerHtml, wireMemberPicker, profileCardHtml } from './ui.js';
-import { notifPermission, requestNotifPermission, showDesktopNotification, playSound, avatarIconFor, unlockAudio } from './notify.js';
+import { toast, openModal, confirmDialog, registerLayer, memberPickerHtml, wireMemberPicker, profileCardHtml, emojiPicker } from './ui.js';
+import {
+  notifPermission, requestNotifPermission, showDesktopNotification, playSound, avatarIconFor, unlockAudio,
+  pushSupported, disablePush, pushDeviceId
+} from './notify.js';
+import { micConstraints, leaveCall } from './voice.js';
+import { becomeAdmin, stepDown, openAdminPanel } from './admin.js';
 
 // ---------------------------------------------------------------------------
 // Image picking (avatars + group icons)
@@ -21,13 +26,13 @@ export function pickImage() {
 }
 
 // Resize (or keep animated GIFs as-is) and upload; returns the server path.
-export async function uploadImageFile(file) {
+export async function uploadImageFile(file, { maxDim = 320, aspect = 1 } = {}) {
   if (!file) return null;
   if (!/^image\/(png|jpeg|gif|webp)$/.test(file.type)) throw new Error('Please pick a PNG, JPG, GIF or WebP image.');
   let blob = file;
   let name = file.name || 'image';
   if (!(file.type === 'image/gif' && file.size < 4 * 1024 * 1024)) {
-    blob = await resizeImage(file, 320, 0.88);
+    blob = await resizeImage(file, maxDim, 0.88, aspect);
     name = name.replace(/\.[^.]+$/, '') + '.jpg';
   }
   const up = uploadFile(blob, { name });
@@ -38,7 +43,7 @@ export async function uploadImageFile(file) {
 // ---------------------------------------------------------------------------
 // Generic full-screen settings frame
 // ---------------------------------------------------------------------------
-function openFullscreen({ nav, initial, render, title }) {
+export function openFullscreen({ nav, initial, render, title }) {
   const el = document.createElement('div');
   el.className = 'settings';
   el.innerHTML = `
@@ -64,6 +69,7 @@ function openFullscreen({ nav, initial, render, title }) {
     current = id;
     drawNav();
     inner.innerHTML = '';
+    inner.onclick = null;
     el.querySelector('.s-content').scrollTop = 0;
     render(id, inner, api2);
   };
@@ -87,11 +93,15 @@ export function openSettings(section) {
     { header: 'User Settings' },
     { id: 'account', label: 'My Account' },
     { id: 'profile', label: 'Profile' },
+    { id: 'customize', label: 'Customize ✨' },
     { header: 'App Settings' },
     { id: 'appearance', label: 'Appearance' },
     { id: 'notifications', label: 'Notifications' },
+    { id: 'voice', label: 'Voice' },
     { id: 'keybinds', label: 'Keybinds' },
     { id: 'about', label: 'About' },
+    { header: 'Server' },
+    { id: 'admin', label: 'Admin' },
     { sep: true },
     { id: 'logout', label: 'Log Out', danger: true, action: () => logout() }
   ];
@@ -101,14 +111,44 @@ export function openSettings(section) {
 async function logout() {
   const ok = await confirmDialog({
     title: 'Log out',
-    html: '<p style="margin:0">Are you sure you want to log out? <b>Copy your login code first</b> (My Account) if you want to get back into this same account later.</p>',
+    html: `<p style="margin:0">${state.me.hasPassword ? 'Are you sure you want to log out?' : "You haven't set a password yet, so you won't be able to get back into this account. Set one in My Account first."}</p>`,
     confirm: 'Log Out',
     danger: true
   });
   if (!ok) return;
-  try { localStorage.removeItem('auth_token'); localStorage.removeItem('site_key'); } catch (e) {}
+  leaveCall({ silent: true });
+  await disablePush();
+  await api('POST', '/api/auth/logout', {}, { quiet: true }).catch(() => {});
+  try { localStorage.removeItem('auth_token'); } catch (e) {}
   location.hash = '';
   location.reload();
+}
+
+// Accounts from before logins existed have no username or password yet.
+export function openClaimDialog() {
+  const m = openModal(`
+    <div class="modal-head"><h2>Secure your account</h2><p>Messages has real logins now. Pick a username and password so you can get back into this account from any device.</p></div>
+    <form id="cl-form">
+      <div class="modal-body">
+        <div class="field"><label class="label" for="cl-user">Username</label><input class="input" id="cl-user" maxlength="24" autocomplete="username" autofocus></div>
+        <div class="field"><label class="label" for="cl-pw">Password</label><input class="input" id="cl-pw" type="password" autocomplete="new-password"></div>
+        <div class="field"><label class="label" for="cl-pw2">Confirm password</label><input class="input" id="cl-pw2" type="password" autocomplete="new-password"></div>
+        <div class="error" id="cl-err"></div>
+      </div>
+      <div class="modal-foot"><button class="btn ghost" type="button" data-close>Later</button><button class="btn" type="submit">Save</button></div>
+    </form>`);
+  $('#cl-form', m.el).onsubmit = async (e) => {
+    e.preventDefault();
+    const err = $('#cl-err', m.el);
+    const password = $('#cl-pw', m.el).value;
+    if (password !== $('#cl-pw2', m.el).value) { err.textContent = "Passwords don't match."; return; }
+    try {
+      const res = await api('POST', '/api/me/credentials', { username: $('#cl-user', m.el).value.trim(), password });
+      actions.setMe(res.user);
+      m.close();
+      toast('Account secured 🔐', 'ok');
+    } catch (ex) { err.textContent = ex.message; }
+  };
 }
 
 function renderSettings(id, root, frame) {
@@ -117,34 +157,56 @@ function renderSettings(id, root, frame) {
     root.innerHTML = `
       <h2>My Account</h2>
       <div class="account-card">
-        <div class="banner" style="background:${esc(bannerColor(me))}"></div>
-        <div class="row">${avatarHtml(me, 80, { status: true })}<div class="n">${esc(me.name)}</div><button class="btn sm" data-go="profile">Edit User Profile</button></div>
+        <div class="banner" style="${esc(bannerStyle(me))}"></div>
+        <div class="row">${avatarHtml(me, 80, { status: true })}<div class="n">${nameHtml(me)}${badgesHtml(me)}</div><button class="btn sm" data-go="profile">Edit User Profile</button></div>
         <div class="inner">
           <div class="kv"><div><div class="k">Display name</div><div class="v">${esc(me.name)}</div></div><button class="btn secondary sm" data-go="profile">Edit</button></div>
+          <div class="kv"><div><div class="k">Username</div><div class="v">${esc(me.username || 'Not set yet')}</div></div><button class="btn secondary sm" data-act="${me.hasPassword ? 'username' : 'claim'}">${me.hasPassword ? 'Change' : 'Set up'}</button></div>
           <div class="kv"><div><div class="k">Status</div><div class="v">${esc(STATUS_LABEL[me.status] || 'Online')}</div></div><button class="btn secondary sm" data-act="status">Change</button></div>
           <div class="kv"><div><div class="k">Member since</div><div class="v">${esc(new Date(me.createdAt || Date.now()).toLocaleDateString())}</div></div></div>
         </div>
       </div>
-      <h3>Login code</h3>
-      <div class="hint" style="margin:0 0 10px">Your login code is how this browser proves it's you. Use it to sign in to the <b>same account</b> on another device or browser. Anyone with it can post as you — keep it secret.</div>
-      <div class="secret" id="login-code">••••••••••••••••••••••••••••••••••••••••</div>
-      <div style="display:flex;gap:8px;margin-top:10px">
-        <button class="btn secondary sm" data-act="reveal">Show</button>
-        <button class="btn sm" data-act="copy">Copy login code</button>
-      </div>
+      ${me.hasPassword ? `<h3>Password</h3>
+      <form id="pw-form" class="pw-form">
+        <div class="field"><label class="label" for="pw-cur">Current password</label><input class="input" id="pw-cur" type="password" autocomplete="current-password"></div>
+        <div class="field"><label class="label" for="pw-new">New password</label><input class="input" id="pw-new" type="password" autocomplete="new-password"></div>
+        <div class="field"><label class="label" for="pw-new2">Confirm new password</label><input class="input" id="pw-new2" type="password" autocomplete="new-password"></div>
+        <div class="error" id="pw-err"></div>
+        <button class="btn sm" type="submit">Change Password</button>
+      </form>` : ''}
+      <div class="divider"></div>
+      <h3>Devices</h3>
+      <div class="hint" style="margin:0 0 10px">Lost a device or used a shared computer? This signs out everywhere except here.</div>
+      <button class="btn secondary sm" data-act="others">Log Out Other Devices</button>
       <div class="divider"></div>
       <h3>Log out</h3>
-      <div class="hint" style="margin:0 0 10px">Signs this browser out. You'll need the access key and your login code to get back into this account.</div>
+      <div class="hint" style="margin:0 0 10px">Signs this browser out. You'll need your username and password to get back in.</div>
       <button class="btn outline-danger sm" data-act="logout">Log Out</button>`;
-    root.addEventListener('click', async (e) => {
+    const pwForm = $('#pw-form', root);
+    if (pwForm) pwForm.onsubmit = async (e) => {
+      e.preventDefault();
+      const err = $('#pw-err', root);
+      const password = $('#pw-new', root).value;
+      if (password !== $('#pw-new2', root).value) { err.textContent = "Passwords don't match."; return; }
+      try {
+        await api('POST', '/api/me/credentials', { currentPassword: $('#pw-cur', root).value, password });
+        toast('Password changed. Other devices were signed out.', 'ok');
+        frame.redraw();
+      } catch (ex) { err.textContent = ex.message; }
+    };
+    root.onclick = async (e) => {
       const b = e.target.closest('[data-go],[data-act]');
       if (!b) return;
+      const act = b.dataset.act;
       if (b.dataset.go) frame.show(b.dataset.go);
-      else if (b.dataset.act === 'reveal') { $('#login-code', root).textContent = session.token; b.remove(); }
-      else if (b.dataset.act === 'copy') { if (await copyText(session.token)) toast('Login code copied — keep it somewhere safe.', 'ok'); }
-      else if (b.dataset.act === 'logout') logout();
-      else if (b.dataset.act === 'status') actions.openStatusMenu(b, () => frame.redraw());
-    });
+      else if (act === 'logout') logout();
+      else if (act === 'status') actions.openStatusMenu(b, () => frame.redraw());
+      else if (act === 'claim') openClaimDialog();
+      else if (act === 'username') changeUsername(frame);
+      else if (act === 'others') {
+        try { await api('POST', '/api/me/logout-others', {}); toast('Other devices were signed out', 'ok'); } catch (ex) { toast(ex.message, 'error'); }
+      }
+    };
     return;
   }
 
@@ -172,7 +234,7 @@ function renderSettings(id, root, frame) {
       </div>`;
     const prev = () => {
       const u = Object.assign({}, me, draft, { name: draft.name || me.name });
-      $('#pe-prev', root).innerHTML = profileCardHtml(u).replace(/<div class="pp-actions">[\s\S]*?<\/div>\s*<\/div>\s*$/, '</div>');
+      $('#pe-prev', root).innerHTML = profileCardHtml(u, { preview: true });
       $('#pe-bio-count', root).textContent = (300 - draft.bio.length) + ' left';
     };
     prev();
@@ -211,6 +273,24 @@ function renderSettings(id, root, frame) {
         btn.disabled = false;
       }
     };
+    return;
+  }
+
+  if (id === 'customize') { renderCustomize(root, frame); return; }
+  if (id === 'voice') { renderVoiceSettings(root, frame); return; }
+  if (id === 'admin') {
+    root.innerHTML = me.isAdmin ? `
+      <h2>Admin</h2>
+      <div class="perm-box ok"><div class="pi">🛡️</div><div class="pt"><b>You're an admin</b>You can set the server status, manage people and groups, and make invites.</div><button class="btn sm" id="ad-open">Open Admin Panel</button></div>
+      <button class="btn ghost sm" id="ad-resign">Step down</button>` : `
+      <h2>Admin</h2>
+      <div class="perm-box"><div class="pi">🛡️</div><div class="pt"><b>Become an admin</b>Admins can set the server status, set other people's status, kick people and manage the server. You'll need the admin code.</div><button class="btn sm" id="ad-claim">Become Admin</button></div>`;
+    if (me.isAdmin) {
+      $('#ad-open', root).onclick = () => openAdminPanel();
+      $('#ad-resign', root).onclick = () => stepDown(() => frame.redraw());
+    } else {
+      $('#ad-claim', root).onclick = () => becomeAdmin(() => frame.redraw());
+    }
     return;
   }
 
@@ -261,7 +341,7 @@ function renderSettings(id, root, frame) {
   if (id === 'notifications') {
     const perm = notifPermission();
     const permBox = perm === 'granted'
-      ? `<div class="perm-box ok"><div class="pi">✅</div><div class="pt"><b>Desktop notifications are allowed</b>New messages pop up on Windows (or macOS / Linux) while Messages is open in a tab — even if it's minimised or in the background.</div></div>`
+      ? `<div class="perm-box ok"><div class="pi">✅</div><div class="pt"><b>Desktop notifications are allowed</b>New messages pop up on Windows (or macOS / Linux), even with every Messages tab closed.</div></div>`
       : perm === 'denied'
         ? `<div class="perm-box bad"><div class="pi">🚫</div><div class="pt"><b>Your browser is blocking notifications</b>Click the 🔒 / ⓘ icon at the left of the address bar, set <i>Notifications</i> to <i>Allow</i>, then reload the page.</div></div>`
         : perm === 'unsupported'
@@ -276,14 +356,15 @@ function renderSettings(id, root, frame) {
         <label class="switch"><input type="checkbox" id="nt-mute" ${prefs.muteAll ? 'checked' : ''}><span></span></label>
       </div>
       ${toggleRow('nt-desktop', 'Enable desktop notifications', 'Show a system notification for new messages.', prefs.desktop && perm === 'granted')}
+      ${pushSupported() ? toggleRow('nt-push', 'Notify me when Messages is closed', 'Keeps working with every tab closed, as long as your browser is running. In Chrome, also turn on <i>Settings → System → Continue running background apps</i> to get them with every window closed.', prefs.pushEnabled && prefs.desktop && perm === 'granted') : ''}
       ${toggleRow('nt-mentions', 'Only DMs and @mentions', 'Group messages only notify you when someone @mentions you or replies to you.', prefs.mentionsOnly)}
       ${toggleRow('nt-preview', 'Show message text', "Include the message in the notification. Turn off if people can see your screen.", prefs.notifPreview)}
       ${toggleRow('nt-sounds', 'Notification sounds', 'Play a short sound for new messages.', prefs.sounds, '<button class="btn ghost xs" id="nt-play" style="padding:0;margin-top:4px">▶ Play sound</button>')}
       ${toggleRow('nt-badge', 'Unread badge on the tab', 'Show the unread count in the browser tab title and icon.', prefs.titleBadge)}
-      <div style="margin-top:16px"><button class="btn secondary sm" id="nt-test">Send a test notification</button></div>
+      <div style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap"><button class="btn secondary sm" id="nt-test">Send a test notification</button>${pushSupported() ? '<button class="btn secondary sm" id="nt-test-push">Test with the tab closed</button>' : ''}</div>
       <h3>Muted chats</h3>
       <div id="nt-muted"></div>
-      <div class="hint" style="margin-top:16px">Your status matters too: <b>Do Not Disturb</b> silences notifications just like the mute switch. Notifications appear while Messages is open somewhere (any tab, background or minimised).</div>`;
+      <div class="hint" style="margin-top:16px">Your status matters too: <b>Do Not Disturb</b> silences notifications just like the mute switch.</div>`;
     const drawMuted = () => {
       const muted = Object.keys(prefs.mutedChats || {}).map((id) => state.chats.get(id)).filter(Boolean);
       $('#nt-muted', root).innerHTML = muted.length
@@ -291,15 +372,27 @@ function renderSettings(id, root, frame) {
         : '<div class="hint" style="margin:0">Nothing muted. Use the 🔔 button at the top of any chat to mute it.</div>';
     };
     drawMuted();
-    root.addEventListener('click', (e) => {
+    root.onclick = (e) => {
       const b = e.target.closest('[data-unmute]');
       if (b) { delete prefs.mutedChats[b.dataset.unmute]; savePrefs(); drawMuted(); actions.refreshAll(); }
-    });
+    };
     const allow = $('#nt-allow', root);
     if (allow) allow.onclick = async () => {
       const p = await requestNotifPermission();
-      if (p === 'granted') { prefs.desktop = true; savePrefs(); toast('Desktop notifications are on 🎉', 'ok'); }
+      if (p === 'granted') { prefs.desktop = true; savePrefs(); actions.setupPush(); toast('Desktop notifications are on 🎉', 'ok'); }
       actions.refreshChrome();
+      frame.redraw();
+    };
+    const pushToggle = $('#nt-push', root);
+    if (pushToggle) pushToggle.onchange = async (e) => {
+      if (e.target.checked && notifPermission() !== 'granted') {
+        const p = await requestNotifPermission();
+        if (p !== 'granted') { toast('Allow notifications first — see above.', 'error'); frame.redraw(); return; }
+        prefs.desktop = true;
+      }
+      prefs.pushEnabled = e.target.checked;
+      savePrefs();
+      if (e.target.checked) await actions.setupPush(); else await disablePush();
       frame.redraw();
     };
     $('#nt-mute', root).onchange = (e) => { actions.setMuteAll(e.target.checked); frame.redraw(); };
@@ -308,13 +401,27 @@ function renderSettings(id, root, frame) {
         const p = await requestNotifPermission();
         if (p !== 'granted') { e.target.checked = false; toast(p === 'denied' ? 'Your browser is blocking notifications — see above for how to allow them.' : 'Notifications were not enabled.', 'error'); frame.redraw(); return; }
       }
-      prefs.desktop = e.target.checked; savePrefs(); actions.refreshChrome(); frame.redraw();
+      prefs.desktop = e.target.checked;
+      savePrefs();
+      if (e.target.checked) await actions.setupPush(); else await disablePush();
+      actions.refreshChrome();
+      frame.redraw();
     };
     $('#nt-mentions', root).onchange = (e) => { prefs.mentionsOnly = e.target.checked; savePrefs(); };
     $('#nt-preview', root).onchange = (e) => { prefs.notifPreview = e.target.checked; savePrefs(); };
     $('#nt-sounds', root).onchange = (e) => { prefs.sounds = e.target.checked; savePrefs(); };
     $('#nt-play', root).onclick = (e) => { e.preventDefault(); unlockAudio(); playSound('message'); };
     $('#nt-badge', root).onchange = (e) => { prefs.titleBadge = e.target.checked; savePrefs(); actions.refreshChrome(); };
+    const pushTest = $('#nt-test-push', root);
+    if (pushTest) pushTest.onclick = async () => {
+      await actions.setupPush();
+      const id = pushDeviceId();
+      if (!id) { toast('Turn on "Notify me when Messages is closed" first.', 'error'); return; }
+      try {
+        await api('POST', '/api/push/test', { id });
+        toast('Close this tab now. A notification should appear in 10 seconds.', 'ok');
+      } catch (e) { toast(e.message, 'error'); }
+    };
     $('#nt-test', root).onclick = async () => {
       unlockAudio();
       if (prefs.sounds) playSound('test');
@@ -347,7 +454,8 @@ function renderSettings(id, root, frame) {
       ['Open settings', 'Ctrl+,'],
       ['Upload a file', 'Ctrl+Shift+U'],
       ['Toggle mute all notifications', 'Ctrl+Shift+D'],
-      ['Delete a message without confirming', 'Shift + click 🗑️']
+      ['Delete a message without confirming', 'Shift + click 🗑️'],
+      ['Mute / unmute in a call', 'Ctrl+Shift+M']
     ];
     root.innerHTML = `<h2>Keybinds</h2><table class="keys-table">${rows.map((r) => `<tr><td>${esc(r[0])}</td><td>${k(r[1])}</td></tr>`).join('')}</table>
       <h3>Formatting</h3>
@@ -377,7 +485,7 @@ function renderSettings(id, root, frame) {
 
   if (id === 'about') {
     root.innerHTML = `<h2>About</h2>
-      <p>Messages — a private chat app with groups, channels, DMs, file & project sharing, and desktop notifications.</p>
+      <p>Messages — a private chat app with groups, channels, DMs, voice calls, file & project sharing, and desktop notifications.</p>
       <div class="hint">Server: ${esc(location.hostname)} · Max upload size: ${esc(fmtSize(state.maxUploadBytes))}</div>
       <h3>Tips</h3>
       <ul style="line-height:1.7;color:var(--text)">
@@ -387,6 +495,187 @@ function renderSettings(id, root, frame) {
         <li>Click someone's name or picture to see their profile and DM them.</li>
       </ul>`;
   }
+}
+
+function changeUsername(frame) {
+  const m = openModal(`
+    <div class="modal-head"><h2>Change your username</h2><p>You'll use it to log in.</p></div>
+    <form id="un-form">
+      <div class="modal-body">
+        <div class="field"><label class="label" for="un-new">New username</label><input class="input" id="un-new" maxlength="24" value="${esc(state.me.username || '')}" autocomplete="username" autofocus></div>
+        <div class="field"><label class="label" for="un-pw">Current password</label><input class="input" id="un-pw" type="password" autocomplete="current-password"></div>
+        <div class="error" id="un-err"></div>
+      </div>
+      <div class="modal-foot"><button class="btn ghost" type="button" data-close>Cancel</button><button class="btn" type="submit">Save</button></div>
+    </form>`);
+  $('#un-form', m.el).onsubmit = async (e) => {
+    e.preventDefault();
+    try {
+      const res = await api('POST', '/api/me/credentials', { username: $('#un-new', m.el).value.trim(), currentPassword: $('#un-pw', m.el).value });
+      actions.setMe(res.user);
+      m.close();
+      toast('Username changed', 'ok');
+      frame.redraw();
+    } catch (ex) { $('#un-err', m.el).textContent = ex.message; }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Customize: the Nitro-style look of your profile. Free for everyone here.
+// ---------------------------------------------------------------------------
+const NAME_FX = [['none', 'None'], ['glow', 'Glow'], ['shimmer', 'Shimmer'], ['rainbow', 'Rainbow'], ['pulse', 'Pulse']];
+const NAME_FONTS = [['default', 'Default'], ['rounded', 'Rounded'], ['serif', 'Serif'], ['mono', 'Mono'], ['hand', 'Handwritten']];
+const RINGS = [['none', 'None'], ['neon', 'Neon'], ['pulse', 'Pulse'], ['gold', 'Gold'], ['fire', 'Fire'], ['ice', 'Ice'], ['rainbow', 'Rainbow'], ['orbit', 'Orbit']];
+
+function colorField(key, label, value, fallback) {
+  return `<div class="color-field"><span class="cf-label">${esc(label)}</span>
+    <input type="color" data-color="${key}" value="${esc(value || fallback)}" aria-label="${esc(label)}">
+    <button class="btn ghost xs" data-clear="${key}" ${value ? '' : 'disabled'}>Clear</button></div>`;
+}
+
+function renderCustomize(root, frame) {
+  const me = state.me;
+  const draft = Object.assign({}, me.look || {});
+  const chips = (key, options) => `<div class="chip-row">${options.map(([v, l]) => `<button class="chip ${(draft[key] || 'none') === v || (key === 'nameFont' && (draft[key] || 'default') === v) ? 'on' : ''}" data-chip="${key}" data-v="${v}">${esc(l)}</button>`).join('')}</div>`;
+  const draw = () => {
+    root.innerHTML = `
+      <h2>Customize ✨</h2>
+      <div class="hint" style="margin:0 0 16px">Everyone sees these on your name, picture and profile.</div>
+      <div class="cz-layout">
+        <div class="pe-form">
+          <label class="label">Name color</label>
+          <div class="color-fields">${colorField('nameColor', 'Color', draft.nameColor, '#ff7ad9')}${colorField('nameColor2', 'Fade to', draft.nameColor2, '#7a9bff')}</div>
+          <label class="label">Name effect</label>${chips('nameFx', NAME_FX)}
+          <label class="label">Name font</label>${chips('nameFont', NAME_FONTS)}
+          <label class="label">Profile picture ring</label>${chips('ring', RINGS)}
+          <div class="color-fields">${colorField('ringColor', 'Ring color', draft.ringColor, '#00e5ff')}</div>
+          <label class="label">Flair</label>
+          <div class="flair-row"><button class="btn secondary sm" id="cz-flair">${draft.flair ? esc(draft.flair) + ' Change' : 'Pick an emoji'}</button>${draft.flair ? '<button class="btn ghost xs" id="cz-flair-rm">Remove</button>' : ''}<span class="hint" style="margin:0">Shown after your name.</span></div>
+          <label class="label">Profile banner</label>
+          <div class="flair-row"><button class="btn secondary sm" id="cz-banner">${draft.banner ? 'Change Image' : 'Upload Image'}</button>${draft.banner ? '<button class="btn ghost xs" id="cz-banner-rm">Remove</button>' : ''}<span class="hint" style="margin:0">Animated GIFs work.</span></div>
+          <div class="color-fields">${colorField('bannerColor2', 'Banner fade', draft.bannerColor2, '#eb459e')}</div>
+          <label class="label">Profile theme</label>
+          <div class="color-fields">${colorField('themeA', 'Top', draft.themeA, '#2b1f4f')}${colorField('themeB', 'Bottom', draft.themeB, '#0e1a33')}</div>
+          <div class="error" id="cz-err"></div>
+          <div style="display:flex;gap:8px;margin-top:6px"><button class="btn" id="cz-save">Save Changes</button><button class="btn ghost" id="cz-reset">Reset Everything</button></div>
+        </div>
+        <div class="cz-preview"><label class="label">Preview</label>
+          <div class="cz-sample">${avatarHtml(Object.assign({}, me, { look: draft }), 40)}<div><div class="msg-head"><span class="msg-author">${nameHtml(Object.assign({}, me, { look: draft }))}${badgesHtml(Object.assign({}, me, { look: draft }))}</span></div><div>Looking good!</div></div></div>
+          <div class="popover profile-pop" style="position:relative;animation:none">${profileCardHtml(Object.assign({}, me, { look: draft }), { preview: true })}</div>
+        </div>
+      </div>`;
+    wire();
+  };
+  const wire = () => {
+    $$('[data-chip]', root).forEach((b) => b.onclick = () => { draft[b.dataset.chip] = b.dataset.v; draw(); });
+    $$('[data-color]', root).forEach((i) => {
+      i.onchange = () => { draft[i.dataset.color] = i.value; draw(); };
+    });
+    $$('[data-clear]', root).forEach((b) => b.onclick = () => { draft[b.dataset.clear] = null; draw(); });
+    $('#cz-flair', root).onclick = (e) => emojiPicker(e.currentTarget, (em) => { draft.flair = em; draw(); }, { placement: 'right-start' });
+    const flairRm = $('#cz-flair-rm', root);
+    if (flairRm) flairRm.onclick = () => { draft.flair = ''; draw(); };
+    $('#cz-banner', root).onclick = async (e) => {
+      const btn = e.currentTarget;
+      const file = await pickImage();
+      if (!file) return;
+      btn.disabled = true;
+      btn.textContent = 'Uploading…';
+      try {
+        draft.banner = await uploadImageFile(file, { maxDim: 960, aspect: 3 });
+        draw();
+      } catch (err) {
+        $('#cz-err', root).textContent = err.message;
+        btn.disabled = false;
+        btn.textContent = 'Upload Image';
+      }
+    };
+    const bannerRm = $('#cz-banner-rm', root);
+    if (bannerRm) bannerRm.onclick = () => { draft.banner = null; draw(); };
+    $('#cz-reset', root).onclick = () => { Object.keys(draft).forEach((k) => delete draft[k]); draw(); };
+    $('#cz-save', root).onclick = async (e) => {
+      e.currentTarget.disabled = true;
+      try {
+        const res = await api('PATCH', '/api/me', { look: draft });
+        actions.setMe(res.user);
+        toast('Looking good ✨', 'ok');
+        frame.redraw();
+      } catch (err) { $('#cz-err', root).textContent = err.message; }
+    };
+  };
+  draw();
+}
+
+// ---------------------------------------------------------------------------
+// Voice settings: pick devices and check the mic works
+// ---------------------------------------------------------------------------
+function renderVoiceSettings(root, frame) {
+  root.innerHTML = `
+    <h2>Voice</h2>
+    <div class="field"><label class="label" for="vc-mic">Microphone</label><select class="input" id="vc-mic"></select></div>
+    <div class="field" id="vc-out-wrap"><label class="label" for="vc-out">Speakers</label><select class="input" id="vc-out"></select></div>
+    <h3>Mic test</h3>
+    <div class="hint" style="margin:0 0 10px">Talk and watch the bar. Nobody else can hear this.</div>
+    <div class="mic-test"><button class="btn secondary sm" id="vc-test">Start Test</button><div class="mic-meter"><i id="vc-level"></i></div></div>
+    <div class="error" id="vc-err"></div>
+    <h3>Processing</h3>
+    ${toggleRow('vc-echo', 'Echo cancellation', 'Stops people hearing themselves through your speakers.', prefs.echoCancellation)}
+    ${toggleRow('vc-noise', 'Noise suppression', 'Cuts background noise like fans and typing.', prefs.noiseSuppression)}
+    <div class="hint" style="margin-top:12px">Changes apply the next time you join a call.</div>`;
+  const micSel = $('#vc-mic', root);
+  const outSel = $('#vc-out', root);
+  const fill = async () => {
+    let devices = [];
+    try { devices = await navigator.mediaDevices.enumerateDevices(); } catch (e) {}
+    const opts = (kind, current, fallback) => [`<option value="">${esc(fallback)}</option>`].concat(
+      devices.filter((d) => d.kind === kind && d.deviceId && d.deviceId !== 'default')
+        .map((d, i) => `<option value="${esc(d.deviceId)}" ${d.deviceId === current ? 'selected' : ''}>${esc(d.label || `${kind === 'audioinput' ? 'Microphone' : 'Speakers'} ${i + 1}`)}</option>`)
+    ).join('');
+    micSel.innerHTML = opts('audioinput', prefs.micId, 'Default microphone');
+    outSel.innerHTML = opts('audiooutput', prefs.speakerId, 'Default speakers');
+    $('#vc-out-wrap', root).classList.toggle('hidden', !('setSinkId' in HTMLMediaElement.prototype));
+  };
+  fill();
+  micSel.onchange = () => { prefs.micId = micSel.value; savePrefs(); };
+  outSel.onchange = () => { prefs.speakerId = outSel.value; savePrefs(); };
+  $('#vc-echo', root).onchange = (e) => { prefs.echoCancellation = e.target.checked; savePrefs(); };
+  $('#vc-noise', root).onchange = (e) => { prefs.noiseSuppression = e.target.checked; savePrefs(); };
+
+  let test = null;
+  const stop = () => {
+    if (!test) return;
+    cancelAnimationFrame(test.raf);
+    test.stream.getTracks().forEach((t) => t.stop());
+    test.ctx.close();
+    test = null;
+    $('#vc-test', root).textContent = 'Start Test';
+    $('#vc-level', root).style.width = '0';
+  };
+  $('#vc-test', root).onclick = async () => {
+    if (test) { stop(); return; }
+    $('#vc-err', root).textContent = '';
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia(micConstraints(prefs.micId));
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 512;
+      ctx.createMediaStreamSource(stream).connect(analyser);
+      const buf = new Float32Array(analyser.fftSize);
+      test = { stream, ctx, raf: 0 };
+      $('#vc-test', root).textContent = 'Stop Test';
+      fill();
+      const loop = () => {
+        if (!test || !root.isConnected || !$('#vc-level', root)) { stop(); return; }
+        analyser.getFloatTimeDomainData(buf);
+        const rms = Math.sqrt(buf.reduce((n, v) => n + v * v, 0) / buf.length);
+        $('#vc-level', root).style.width = Math.min(100, rms * 500) + '%';
+        test.raf = requestAnimationFrame(loop);
+      };
+      loop();
+    } catch (e) {
+      $('#vc-err', root).textContent = "Couldn't open your microphone. Check the browser's permission for this site.";
+    }
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -402,10 +691,9 @@ export function openCreateGroup() {
       <button class="upload-circle" id="cg-icon" type="button"><span class="cam">📷</span>Upload<span class="plus">+</span></button>
       <div class="field"><label class="label">Group name <span class="req">*</span></label><input class="input" id="cg-name" maxlength="60" value="${esc((state.me.name || 'My') + "'s group")}" autofocus></div>
       <div class="field"><label class="label">Description</label><input class="input" id="cg-desc" maxlength="300" placeholder="What's this group about?"></div>
-      <label class="label">Who can see it?</label>
-      <label class="radio-card selected"><input type="radio" name="cg-priv" value="open" checked><div><div class="t">🌍 Everyone</div><div class="d">Anyone with the access key can see and join in.</div></div></label>
-      <label class="radio-card"><input type="radio" name="cg-priv" value="private"><div><div class="t">🔐 Only people I pick</div><div class="d">Private — hidden from everyone else.</div></div></label>
-      <div id="cg-members" class="hidden" style="margin-top:8px">${memberPickerHtml(selected)}</div>
+      <label class="label">Invite people</label>
+      <div class="hint" style="margin:0 0 8px">Only people in the group can see it. Anyone in it can invite more people later.</div>
+      <div id="cg-members">${memberPickerHtml(selected)}</div>
       <div class="setting-row" style="padding-bottom:0"><div><div class="t">Password lock</div><div class="d">Ask for a password before the group's messages can be read.</div></div><label class="switch"><input type="checkbox" id="cg-lock"><span></span></label></div>
       <div id="cg-pw" class="hidden" style="margin-top:10px"><input class="input" type="password" id="cg-pw1" placeholder="Password (min 4 characters)" maxlength="60" style="margin-bottom:8px"><input class="input" type="password" id="cg-pw2" placeholder="Confirm password" maxlength="60"></div>
       <div class="error" id="cg-err"></div>
@@ -413,10 +701,6 @@ export function openCreateGroup() {
     <div class="modal-foot"><button class="btn ghost" data-close>Back</button><button class="btn" id="cg-create">Create</button></div>`);
   const el = m.el;
   wireMemberPicker($('#cg-members', el), selected);
-  $$('input[name=cg-priv]', el).forEach((r) => r.onchange = () => {
-    $$('.radio-card', el).forEach((c) => c.classList.toggle('selected', c.querySelector('input').checked));
-    $('#cg-members', el).classList.toggle('hidden', r.value !== 'private' || !r.checked);
-  });
   $('#cg-lock', el).onchange = (e) => $('#cg-pw', el).classList.toggle('hidden', !e.target.checked);
   $('#cg-icon', el).onclick = async () => {
     const file = await pickImage();
@@ -435,8 +719,7 @@ export function openCreateGroup() {
     const err = $('#cg-err', el);
     const name = $('#cg-name', el).value.trim();
     if (!name) { err.textContent = 'Give the group a name.'; return; }
-    const isPrivate = el.querySelector('input[name=cg-priv]:checked').value === 'private';
-    const body = { type: 'group', name, description: $('#cg-desc', el).value, icon, private: isPrivate, memberIds: Array.from(selected) };
+    const body = { type: 'group', name, description: $('#cg-desc', el).value, icon, memberIds: Array.from(selected) };
     if ($('#cg-lock', el).checked) {
       const p1 = $('#cg-pw1', el).value;
       if (p1.length < 4) { err.textContent = 'Password must be at least 4 characters.'; return; }
@@ -463,7 +746,7 @@ export function openCreateGroup() {
 // New DM (pick a person)
 // ---------------------------------------------------------------------------
 export function openNewDM() {
-  const users = Array.from(state.users.values()).filter((u) => u.id !== state.me.id)
+  const users = Array.from(state.users.values()).filter((u) => u.id !== state.me.id && !u.banned)
     .sort((a, b) => (statusOf(a.id) === 'offline') - (statusOf(b.id) === 'offline') || a.name.localeCompare(b.name));
   const m = openModal(`
     <div class="modal-head"><h2>Start a conversation</h2><p>Message anyone — they'll get it even if they're offline right now.</p><button class="icon-btn close" data-close aria-label="Close">✕</button></div>
@@ -476,7 +759,7 @@ export function openNewDM() {
     const list = users.filter((u) => !q || u.name.toLowerCase().includes(q));
     $('#nd-list', m.el).innerHTML = list.length ? list.map((u) => `
       <div class="pick-row" data-u="${esc(u.id)}">${avatarHtml(u, 32, { status: true })}<span class="n">${esc(u.name)}<span style="display:block;font-size:12px;color:var(--muted);font-weight:400">${esc(u.customStatus || STATUS_LABEL[statusOf(u.id)])}</span></span><span class="btn sm">Message</span></div>`).join('')
-      : `<div class="side-empty">${users.length ? 'Nobody matches that name.' : "Nobody else has joined yet — share the link and access key with your friends!"}</div>`;
+      : `<div class="side-empty">${users.length ? 'Nobody matches that name.' : 'Nobody else has joined yet. Ask an admin for an invite to send your friends!'}</div>`;
   };
   draw();
   $('#nd-q', m.el).oninput = draw;
@@ -543,7 +826,7 @@ export function openGroupSettings(chatId, section) {
     { header: chat0.name },
     { id: 'overview', label: 'Overview' },
     { id: 'channels', label: 'Channels' },
-    { id: 'members', label: 'Members & Privacy' },
+    { id: 'members', label: 'Members' },
     { id: 'security', label: 'Password Lock' },
     { sep: true },
     { id: 'delete', label: 'Delete Group', danger: true, action: () => deleteGroup(chatId, frame) }
@@ -615,21 +898,17 @@ function renderGroupSettings(chatId, id, root) {
   if (id === 'members') {
     const isPrivate = Array.isArray(chat.memberIds);
     const selected = new Set((chat.memberIds || []).filter((x) => x !== state.me.id));
-    root.innerHTML = `<h2>Members & Privacy</h2>
-      <label class="radio-card ${!isPrivate ? 'selected' : ''}"><input type="radio" name="gs-priv" value="open" ${!isPrivate ? 'checked' : ''}><div><div class="t">🌍 Everyone</div><div class="d">Anyone with the access key can see this group.</div></div></label>
-      <label class="radio-card ${isPrivate ? 'selected' : ''}"><input type="radio" name="gs-priv" value="private" ${isPrivate ? 'checked' : ''}><div><div class="t">🔐 Only members</div><div class="d">Only the people ticked below (and you) can see it.</div></div></label>
-      <div id="gs-members" class="${isPrivate ? '' : 'hidden'}" style="margin-top:12px"><label class="label">Members</label>${memberPickerHtml(selected)}</div>
+    root.innerHTML = `<h2>Members</h2>
+      ${isPrivate
+        ? '<div class="hint" style="margin:0 0 12px">Only the people ticked here (and you) can see this group. Untick someone to remove them.</div>'
+        : `<div class="perm-box"><div class="pi">🌍</div><div class="pt"><b>This group is open to everyone</b>It was made before groups became invite-only. Tick who should stay, then save to make it invite-only. This can't be undone.</div></div>`}
+      <div id="gs-members" style="margin-top:12px"><label class="label">Members</label>${memberPickerHtml(selected)}</div>
       <div class="error" id="gs-err"></div>
       <button class="btn" id="gs-save" style="margin-top:8px">Save Changes</button>`;
     wireMemberPicker($('#gs-members', root), selected);
-    $$('input[name=gs-priv]', root).forEach((r) => r.onchange = () => {
-      $$('.radio-card', root).forEach((c) => c.classList.toggle('selected', c.querySelector('input').checked));
-      $('#gs-members', root).classList.toggle('hidden', !(r.value === 'private' && r.checked));
-    });
     $('#gs-save', root).onclick = async () => {
-      const priv = root.querySelector('input[name=gs-priv]:checked').value === 'private';
       try {
-        const res = await api('PATCH', `/api/chats/${chat.id}`, { private: priv, memberIds: Array.from(selected) });
+        const res = await api('PATCH', `/api/chats/${chat.id}`, { private: true, memberIds: Array.from(selected) });
         actions.upsertChat(res.chat);
         toast('Saved', 'ok');
       } catch (e) { $('#gs-err', root).textContent = e.message; }
@@ -677,22 +956,22 @@ export function openInvite(chatId) {
   if (!chat) return;
   if (!Array.isArray(chat.memberIds)) {
     openModal(`<div class="modal-head"><h2>Invite people</h2><button class="icon-btn close" data-close aria-label="Close">✕</button></div>
-      <div class="modal-body"><p style="margin:0">🌍 <b>${esc(chat.name)}</b> is open to everyone with the access key, so there's no need to invite anyone — just send them the link:</p>
+      <div class="modal-body"><p style="margin:0">🌍 <b>${esc(chat.name)}</b> is open to everyone with an account, so there's no need to invite anyone here. Just send them the link:</p>
       <div class="secret" style="margin-top:12px">${esc(location.origin + location.pathname)}</div></div>
       <div class="modal-foot"><button class="btn" data-close>Done</button></div>`);
     return;
   }
-  const selected = new Set(chat.memberIds.filter((x) => x !== state.me.id));
+  const selected = new Set();
   const m = openModal(`<div class="modal-head"><h2>Invite people to ${esc(chat.name)}</h2><button class="icon-btn close" data-close aria-label="Close">✕</button></div>
-    <div class="modal-body">${memberPickerHtml(selected)}<div class="error" id="iv-err"></div></div>
-    <div class="modal-foot"><button class="btn ghost" data-close>Cancel</button><button class="btn" id="iv-save">Save</button></div>`);
+    <div class="modal-body">${memberPickerHtml(selected, { exclude: chat.memberIds })}<div class="error" id="iv-err"></div></div>
+    <div class="modal-foot"><button class="btn ghost" data-close>Cancel</button><button class="btn" id="iv-save">Invite</button></div>`);
   wireMemberPicker(m.el, selected);
   $('#iv-save', m.el).onclick = async () => {
     try {
-      const res = await api('PATCH', `/api/chats/${chat.id}`, { private: true, memberIds: Array.from(selected) });
+      const res = await api('POST', `/api/chats/${chat.id}/members`, { userIds: Array.from(selected) });
       actions.upsertChat(res.chat);
       m.close();
-      toast('Members updated', 'ok');
+      toast(`Invited ${selected.size} ${selected.size === 1 ? 'person' : 'people'}`, 'ok');
     } catch (e) { $('#iv-err', m.el).textContent = e.message; }
   };
 }
@@ -712,7 +991,7 @@ export function openQuickSwitcher() {
   let items = [];
   const build = () => {
     const out = [];
-    state.users.forEach((u) => { if (u.id !== state.me.id) out.push({ kind: 'user', id: u.id, label: u.name, sub: 'Person', html: avatarHtml(u, 28, { status: true }) }); });
+    state.users.forEach((u) => { if (u.id !== state.me.id && !u.banned) out.push({ kind: 'user', id: u.id, label: u.name, sub: 'Person', html: avatarHtml(u, 28, { status: true }) }); });
     state.chats.forEach((c) => {
       if (c.type === 'group') {
         c.channels.forEach((ch) => out.push({ kind: 'channel', chatId: c.id, id: ch.id, label: ch.name, sub: c.name, html: '<span style="width:28px;text-align:center;font-size:20px;color:var(--muted)">#</span>' }));

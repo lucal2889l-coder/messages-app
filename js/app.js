@@ -3,11 +3,12 @@ import {
   $, $$, esc, genId, sha256Hex, debounce, copyText, fmtSize, msgTimestamp, timeOnly, fullDate, dayDivider,
   ago, fileKind, fileIcon
 } from './util.js';
-import { api, session, hooks, checkKey, uploadFile, mediaUrl, ApiError } from './api.js';
+import { api, session, hooks, checkServer, uploadFile, mediaUrl, ApiError } from './api.js';
 import { WS_URL, API_VERSION, MAX_TEXT, MAX_ATTACHMENTS } from './config.js';
 import {
   state, actions, prefs, savePrefs, applyAppearance, getUser, userName, statusOf, STATUS_LABEL, dmOther,
-  chatName, findChannel, canManage, chatMembers, isChatMuted, chatUnread, isLockedForMe, avatarHtml
+  chatName, findChannel, canManage, chatMembers, isChatMuted, chatUnread, isLockedForMe, avatarHtml, nameHtml,
+  badgesHtml, SERVER_STATUS
 } from './store.js';
 import { renderMarkdown, extractEmbeds, plainText } from './markdown.js';
 import { replaceShortcodes, searchEmoji, isEmojiOnly } from './emoji.js';
@@ -16,13 +17,20 @@ import {
   profilePopout, profileCardHtml, openCodeViewer, openZipViewer
 } from './ui.js';
 import {
-  openSettings, openCreateGroup, openNewDM, openGroupSettings, openChannelEditor, openInvite, openQuickSwitcher
+  openSettings, openCreateGroup, openNewDM, openGroupSettings, openChannelEditor, openInvite, openQuickSwitcher,
+  openClaimDialog
 } from './settings.js';
 import {
   registerServiceWorker, notifPermission, notifSupported, requestNotifPermission, showDesktopNotification,
-  playSound, unlockAudio, setTabBadge, avatarIconFor
+  playSound, unlockAudio, setTabBadge, avatarIconFor, syncPush, updatePushPrefs, pushDeviceId
 } from './notify.js';
 import { createZip } from './zip.js';
+import { loadGifs, gifBoxHtml } from './gifs.js';
+import { openAdminUser } from './admin.js';
+import {
+  initVoice, handleCallEvent, onVoiceReconnect, ingestCalls, renderCallUi, callButtonState, callCount, toggleCall,
+  toggleMute, inCall, PHONE
+} from './voice.js';
 
 // ---------------------------------------------------------------------------
 // Icons (inline SVG so they follow the theme colour)
@@ -63,7 +71,7 @@ const isMobile = () => window.innerWidth <= 720;
 // Boot / access key / account
 // ---------------------------------------------------------------------------
 function showScreen(id) {
-  ['boot-screen', 'gate-screen', 'onboard-screen'].forEach((s) => $('#' + s).classList.toggle('hidden', s !== id));
+  ['boot-screen', 'auth-screen'].forEach((s) => $('#' + s).classList.toggle('hidden', s !== id));
   $('#app').classList.toggle('hidden', id !== 'app');
 }
 
@@ -76,149 +84,120 @@ function bootMessage(msg, { retry = false, spinner = false } = {}) {
 }
 
 let authFailing = false;
-hooks.onUnauthorized = (err) => {
+hooks.onUnauthorized = () => {
   if (authFailing) return;
   authFailing = true;
-  if (err && err.data && err.data.error === 'bad-token') {
-    LS.del('auth_token');
-    toast('You were signed out. Sign back in with your login code, or create a new account.', 'error');
-  } else {
-    LS.del('site_key');
-    toast('The access key has changed — please enter the new one.', 'error');
-  }
+  LS.del('auth_token');
+  toast('You were signed out. Log back in to continue.', 'error');
   setTimeout(() => location.reload(), 1600);
 };
+hooks.onMaintenance = (err) => {
+  state.server = Object.assign({}, state.server, { status: 'maintenance', message: err.message });
+  renderServerStatus();
+};
+
+// Why you landed back on the login screen, carried across the reload.
+function setAuthNote(text) {
+  try { sessionStorage.setItem('auth_note', text); } catch (e) {}
+}
+function takeAuthNote() {
+  try {
+    const note = sessionStorage.getItem('auth_note');
+    sessionStorage.removeItem('auth_note');
+    return note || '';
+  } catch (e) { return ''; }
+}
 
 async function boot() {
   applyAppearance();
   bootMessage('Starting Messages…', { spinner: true });
   registerServiceWorker();
-  const key = LS.get('site_key');
-  if (!key) return showGate();
-  const r = await checkKey(key);
-  if (!r.ok) {
-    if (r.offline) return bootMessage("Can't reach the server right now. It might be restarting — try again in a moment.", { retry: true });
-    LS.del('site_key');
-    return showGate(r.error);
-  }
-  if ((r.api || 1) < API_VERSION) {
+  LS.del('site_key'); // from before accounts existed
+  const r = await checkServer();
+  if (!r.ok) return bootMessage("Can't reach the server right now. It might be restarting — try again in a moment.", { retry: true });
+  if (r.api < API_VERSION) {
     return bootMessage('The server is running an older version of Messages. Redeploy the backend so it matches this page, then try again.', { retry: true });
   }
-  session.key = key;
+  if (r.server) state.server = r.server;
   const token = LS.get('auth_token');
-  if (!token) return showOnboarding();
+  if (!token) return showAuth('login', takeAuthNote());
   session.token = token;
   startApp();
 }
 
-function showGate(err) {
-  showScreen('gate-screen');
-  const input = $('#gate-key');
-  input.value = '';
-  $('#gate-error').textContent = err || '';
-  setTimeout(() => input.focus(), 50);
-  $('#gate-form').onsubmit = async (e) => {
-    e.preventDefault();
-    const val = input.value;
-    if (!val) return;
-    const btn = $('#gate-submit');
-    btn.disabled = true;
-    btn.textContent = 'Checking…';
-    const r = await checkKey(val);
-    btn.disabled = false;
-    btn.textContent = 'Continue';
-    if (!r.ok) {
-      $('#gate-error').textContent = r.error;
-      input.select();
-      return;
-    }
-    LS.set('site_key', val);
-    boot();
-  };
-}
-
-let triedLegacy = false;
-async function showOnboarding(mode = 'new') {
-  // People coming from the old version of the app have a profile saved in
-  // this browser — upgrade them automatically and keep their identity.
-  let legacy = null;
-  try { legacy = JSON.parse(LS.get('profile') || 'null'); } catch (e) {}
-  if (legacy && legacy.id && legacy.name && mode === 'new' && !triedLegacy) {
-    triedLegacy = true;
-    bootMessage('Upgrading your account…', { spinner: true });
-    try {
-      const body = { name: String(legacy.name).slice(0, 32), claimId: legacy.id };
-      if (typeof legacy.avatar === 'string' && /^data:image\/(png|jpe?g|gif|webp);base64,/.test(legacy.avatar) && legacy.avatar.length < 390000) body.avatar = legacy.avatar;
-      const res = await api('POST', '/api/users/register', body, { quiet: true });
-      LS.set('auth_token', res.token);
-      LS.del('profile');
-      session.token = res.token;
-      toast(`Welcome back, ${res.user.name}! Messages just got a big upgrade ✨`, 'ok');
-      return startApp();
-    } catch (e) { /* fall back to the normal screen */ }
-  }
-
-  showScreen('onboard-screen');
-  const form = $('#onboard-form');
-  if (mode === 'code') {
+function showAuth(mode = 'login', note = '') {
+  showScreen('auth-screen');
+  const form = $('#auth-form');
+  const maintenance = state.server.status === 'maintenance'
+    ? `<div class="auth-note">🛠️ ${esc(state.server.message || 'Down for maintenance.')} Only admins can get in right now.</div>` : '';
+  const noteHtml = note ? `<div class="auth-note bad">${esc(note)}</div>` : '';
+  if (mode === 'signup') {
     form.innerHTML = `
       <img class="auth-logo" src="icon.svg" alt="">
-      <h1>Sign in with a login code</h1>
-      <p>Find it in <b>Settings → My Account</b> on a device where you're already signed in.</p>
-      <div class="field"><label class="label" for="ob-code">Login code</label><input class="input" id="ob-code" autocomplete="off" spellcheck="false"></div>
-      <div class="error" id="ob-err"></div>
-      <button class="btn block" type="submit" id="ob-go">Sign In</button>
-      <div class="auth-alt"><button type="button" id="ob-switch">← Create a new account instead</button></div>`;
-    setTimeout(() => $('#ob-code').focus(), 50);
+      <h1>Create an account</h1>
+      <p>You'll need a token from an admin.</p>
+      ${maintenance}
+      <div class="field"><label class="label" for="au-token">Admin token <span class="req">*</span></label><input class="input" id="au-token" autocomplete="off" spellcheck="false" required></div>
+      <div class="field"><label class="label" for="au-user">Username <span class="req">*</span></label><input class="input" id="au-user" maxlength="24" autocomplete="username" spellcheck="false" required></div>
+      <div class="field"><label class="label" for="au-name">Display name</label><input class="input" id="au-name" maxlength="32" autocomplete="nickname"></div>
+      <div class="field"><label class="label" for="au-pw">Password <span class="req">*</span></label><input class="input" id="au-pw" type="password" autocomplete="new-password" required></div>
+      <div class="field"><label class="label" for="au-pw2">Confirm password <span class="req">*</span></label><input class="input" id="au-pw2" type="password" autocomplete="new-password" required></div>
+      <div class="error" id="au-err"></div>
+      <button class="btn block" type="submit" id="au-go">Create Account</button>
+      <div class="auth-alt">Already have an account? <button type="button" id="au-switch">Log in</button></div>`;
+    $('#au-token').focus();
     form.onsubmit = async (e) => {
       e.preventDefault();
-      const code = $('#ob-code').value.trim();
-      if (!code) return;
-      session.token = code;
-      try {
-        await api('GET', '/api/me', undefined, { quiet: true });
-        LS.set('auth_token', code);
-        startApp();
-      } catch (err) {
-        session.token = null;
-        $('#ob-err').textContent = err.status === 401 ? "That login code isn't valid." : err.message;
-      }
+      const err = $('#au-err');
+      const password = $('#au-pw').value;
+      if (password !== $('#au-pw2').value) { err.textContent = "Passwords don't match."; return; }
+      // Browsers from the very first version keep their old messages.
+      let legacy = null;
+      try { legacy = JSON.parse(LS.get('profile') || 'null'); } catch (ex) {}
+      const body = { token: $('#au-token').value.trim(), username: $('#au-user').value.trim(), name: $('#au-name').value.trim(), password, claimId: legacy && legacy.id };
+      await submitAuth('/api/auth/signup', body);
     };
   } else {
     form.innerHTML = `
       <img class="auth-logo" src="icon.svg" alt="">
-      <h1>Welcome to Messages!</h1>
-      <p>Pick a display name — it's how everyone will see you. You can add a profile picture right after.</p>
-      <div class="field"><label class="label" for="ob-name">Display name <span class="req">*</span></label><input class="input" id="ob-name" maxlength="32" autocomplete="nickname"></div>
-      <div class="error" id="ob-err"></div>
-      <button class="btn block" type="submit" id="ob-go">Continue</button>
-      <div class="auth-alt">Already have an account? <button type="button" id="ob-switch">Use a login code</button></div>`;
-    setTimeout(() => $('#ob-name').focus(), 50);
+      <h1>Welcome back!</h1>
+      <p>Log in to Messages.</p>
+      ${noteHtml}${maintenance}
+      <div class="field"><label class="label" for="au-user">Username</label><input class="input" id="au-user" maxlength="24" autocomplete="username" spellcheck="false" required></div>
+      <div class="field"><label class="label" for="au-pw">Password</label><input class="input" id="au-pw" type="password" autocomplete="current-password" required></div>
+      <div class="error" id="au-err"></div>
+      <button class="btn block" type="submit" id="au-go">Log In</button>
+      <div class="auth-alt">Need an account? <button type="button" id="au-switch">Create one</button></div>`;
+    $('#au-user').focus();
     form.onsubmit = async (e) => {
       e.preventDefault();
-      const name = $('#ob-name').value.trim();
-      if (!name) { $('#ob-err').textContent = 'Please enter a name.'; return; }
-      $('#ob-go').disabled = true;
-      try {
-        const res = await api('POST', '/api/users/register', { name }, { quiet: true });
-        LS.set('auth_token', res.token);
-        session.token = res.token;
-        await startApp();
-        setTimeout(() => toast('Tip: click your name in the bottom-left to set a picture and status.'), 1200);
-      } catch (err) {
-        $('#ob-err').textContent = err.message;
-        $('#ob-go').disabled = false;
-      }
+      await submitAuth('/api/auth/login', { username: $('#au-user').value.trim(), password: $('#au-pw').value });
     };
   }
-  $('#ob-switch').onclick = () => showOnboarding(mode === 'code' ? 'new' : 'code');
+  $('#au-switch').onclick = () => showAuth(mode === 'signup' ? 'login' : 'signup');
+}
+
+async function submitAuth(path, body) {
+  const btn = $('#au-go');
+  btn.disabled = true;
+  $('#au-err').textContent = '';
+  try {
+    const res = await api('POST', path, body, { quiet: true });
+    LS.set('auth_token', res.token);
+    LS.del('profile');
+    session.token = res.token;
+    await startApp();
+  } catch (e) {
+    $('#au-err').textContent = e.message;
+    btn.disabled = false;
+  }
 }
 
 async function startApp() {
   bootMessage('Loading your chats…', { spinner: true });
   let data;
   try {
-    data = await api('GET', '/api/bootstrap');
+    [data] = await Promise.all([api('GET', '/api/bootstrap'), loadGifs().catch(() => [])]);
   } catch (e) {
     if (e.status === 401) return;
     return bootMessage(e.message || 'Something went wrong.', { retry: true });
@@ -226,6 +205,7 @@ async function startApp() {
   ingestBootstrap(data);
   restoreUnlocks();
   showScreen('app');
+  renderServerStatus();
   connectWS();
   if (!routeFromHash(location.hash, false)) {
     const last = prefs.lastView;
@@ -234,6 +214,79 @@ async function startApp() {
   }
   if (isMobile() && state.view.type === 'home') document.body.classList.add('nav-open');
   refreshNotifBanner();
+  setupPush();
+  if (!state.me.hasPassword) setTimeout(openClaimDialog, 700);
+}
+
+// Closed-tab notifications. The server filters what it sends, so it needs the
+// same notification choices this browser has.
+const pushPrefs = () => ({ muteAll: prefs.muteAll, mentionsOnly: prefs.mentionsOnly, preview: prefs.notifPreview, mutedChats: prefs.mutedChats });
+let lastPushPrefs = '';
+
+async function setupPush() {
+  if (!prefs.pushEnabled || !prefs.desktop) return;
+  try {
+    const id = await syncPush(state.pushKey, pushPrefs());
+    if (id) {
+      lastPushPrefs = JSON.stringify(pushPrefs());
+      wsSend({ type: 'push-id', id });
+    }
+  } catch (e) {
+    console.warn('[push] could not subscribe:', e.message);
+  }
+}
+
+actions.onPrefsSaved = debounce(() => {
+  const now = JSON.stringify(pushPrefs());
+  if (!state.me || now === lastPushPrefs || !pushDeviceId()) return;
+  lastPushPrefs = now;
+  updatePushPrefs(pushPrefs()).catch(() => {});
+}, 800);
+
+// ---------------------------------------------------------------------------
+// Server status + who's allowed to post
+// ---------------------------------------------------------------------------
+let wasLockedOut = false;
+function renderServerStatus() {
+  const s = state.server || {};
+  const b = $('#server-banner');
+  const meta = SERVER_STATUS[s.status] || SERVER_STATUS.online;
+  if (s.status && s.status !== 'online') {
+    b.className = 'sb-' + s.status;
+    b.textContent = `${meta.icon} ${s.message || meta.label}`;
+  } else {
+    b.className = 'hidden';
+    b.textContent = '';
+  }
+  const lockedOut = s.status === 'maintenance' && !!state.me && !state.me.isAdmin;
+  $('#maint-screen').classList.toggle('hidden', !lockedOut);
+  if (lockedOut) $('#maint-msg').textContent = s.message || 'Messages will be back soon.';
+  if (wasLockedOut && !lockedOut) resync();
+  wasLockedOut = lockedOut;
+  applyComposerBlock();
+}
+
+function composerBlock() {
+  const me = state.me;
+  if (!me || me.isAdmin) return null;
+  if (state.server.status === 'readonly') return state.server.message || 'Messages is read-only right now.';
+  if (me.timeoutUntil > Date.now()) return `You're timed out until ${timeOnly(me.timeoutUntil)}.`;
+  return null;
+}
+
+let blockTimer = null;
+function applyComposerBlock() {
+  clearTimeout(blockTimer);
+  const remaining = state.me ? (state.me.timeoutUntil || 0) - Date.now() : 0;
+  if (remaining > 0) blockTimer = setTimeout(applyComposerBlock, Math.min(remaining + 500, 3600000));
+  const input = $('#c-input');
+  if (!input) return;
+  const block = composerBlock();
+  input.disabled = !!block;
+  input.placeholder = block || input.getAttribute('aria-label');
+  ['#c-plus', '#c-gif', '#c-emoji'].forEach((id) => { $(id).disabled = !!block; });
+  if (block) $('#c-send').disabled = true;
+  else updateSendState();
 }
 
 // ---------------------------------------------------------------------------
@@ -243,6 +296,9 @@ function ingestBootstrap(data) {
   state.me = data.me;
   state.reads = Object.assign({}, data.me.reads || {});
   if (data.maxUploadBytes) state.maxUploadBytes = data.maxUploadBytes;
+  if (data.server) state.server = data.server;
+  state.pushKey = data.pushKey || null;
+  ingestCalls(data.calls);
   state.users = new Map((data.users || []).map((u) => [u.id, u]));
   state.chats = new Map();
   (data.chats || []).forEach(ingestChat);
@@ -262,6 +318,7 @@ function upsertChat(c) {
   const prev = state.chats.get(c.id);
   const wasLocked = prev ? isLockedForMe(prev) : null;
   ingestChat(c);
+  if (!prev && c.type === 'group' && state.me && c.ownerId !== state.me.id) toast(`You were added to ${c.name}`, 'ok');
   const v = state.view;
   if (v.type === 'chat' && v.chatId === c.id) {
     if (!c.channels.find((ch) => ch.id === v.channelId)) {
@@ -292,6 +349,7 @@ function setMe(user) {
   delete pub.reads;
   state.users.set(user.id, pub);
   refreshAll();
+  renderServerStatus();
 }
 
 function restoreUnlocks() {
@@ -411,7 +469,8 @@ function currentChat() {
 Object.assign(actions, {
   openChat, openDM, goHome, openSettings, setMe, upsertChat, removeChat, rememberUnlock, refreshAll,
   refreshChrome: () => { renderUserPanel(); updateBadges(); refreshNotifBanner(); },
-  setMuteAll, openStatusMenu
+  setMuteAll, openStatusMenu, setupPush, openAdminUser,
+  onCallsChanged: () => { renderSidebar(); refreshCallButton(); }
 });
 
 // ---------------------------------------------------------------------------
@@ -517,6 +576,11 @@ function chatContextMenu(chat, anchor) {
   openMenu(anchor, items, { placement: 'right-start' });
 }
 
+function callTag(channelId) {
+  const n = callCount(channelId);
+  return n ? `<span class="call-tag" data-tip="${n} in a call">${PHONE}${n}</span>` : '';
+}
+
 function renderSidebar() {
   const header = $('#sidebar-header');
   const body = $('#sidebar-body');
@@ -543,8 +607,8 @@ function renderSidebar() {
       }
       html += `<div class="side-item ${active ? 'active' : ''} ${u.count ? 'unread' : ''} ${isChatMuted(c.id) ? 'muted-chat' : ''}" data-chat="${esc(c.id)}">
         ${avatarHtml(o, 32, { status: true })}
-        <div style="flex:1;min-width:0"><span class="name">${esc(o ? o.name : 'Unknown')}</span>${sub ? `<span class="sub">${esc(sub)}</span>` : ''}</div>
-        ${u.count && !isChatMuted(c.id) ? `<span class="badge">${u.count > 99 ? '99+' : u.count}</span>` : ''}
+        <div style="flex:1;min-width:0"><span class="name">${o ? nameHtml(o) : 'Unknown'}</span>${sub ? `<span class="sub">${esc(sub)}</span>` : ''}</div>
+        ${callTag(ch.id)}${u.count && !isChatMuted(c.id) ? `<span class="badge">${u.count > 99 ? '99+' : u.count}</span>` : ''}
         <span class="item-actions"><button data-close-dm="${esc(c.id)}" data-tip="Close DM" aria-label="Close DM">✕</button></span>
       </div>`;
     });
@@ -566,12 +630,14 @@ function renderSidebar() {
     const muted = isChatMuted(chat.id);
     html += `<div class="side-item ${active ? 'active' : ''} ${u.count && !muted ? 'unread' : ''}" data-chat="${esc(chat.id)}" data-channel="${esc(ch.id)}" ${ch.topic ? `title="${esc(ch.topic)}"` : ''}>
       <span class="hash">#</span><span class="name">${esc(ch.name)}</span>
-      ${u.mentions && !muted ? `<span class="badge">${u.mentions}</span>` : ''}
+      ${callTag(ch.id)}${u.mentions && !muted ? `<span class="badge">${u.mentions}</span>` : ''}
       ${manage ? `<span class="item-actions"><button data-edit-channel="${esc(ch.id)}" data-tip="Edit Channel" aria-label="Edit channel">⚙</button></span>` : ''}
     </div>`;
   });
   const members = chatMembers(chat);
-  html += `<div class="side-section"><span>${Array.isArray(chat.memberIds) ? '🔐 Private' : '🌍 Open to everyone'} · ${members.length}</span></div>`;
+  html += Array.isArray(chat.memberIds)
+    ? `<div class="side-section"><span>Members · ${members.length}</span><button data-invite data-tip="Invite people" aria-label="Invite people">+</button></div>`
+    : `<div class="side-section"><span>🌍 Open to everyone · ${members.length}</span></div>`;
   body.innerHTML = html;
 }
 
@@ -580,6 +646,7 @@ $('#sidebar-body').addEventListener('click', (e) => {
   if (t.closest('[data-new-dm]')) { e.preventDefault(); openNewDM(); return; }
   const cd = t.closest('[data-close-dm]');
   if (cd) { e.stopPropagation(); closeDM(cd.dataset.closeDm); return; }
+  if (t.closest('[data-invite]')) { openInvite(activeGroupId()); return; }
   if (t.closest('[data-new-channel]')) { const c = state.chats.get(activeGroupId()); if (c) openChannelEditor(c, null); return; }
   const ec = t.closest('[data-edit-channel]');
   if (ec) {
@@ -670,7 +737,7 @@ function renderUserPanel() {
   const st = statusOf(me.id);
   $('#user-panel').innerHTML = `
     <div class="me-card" id="me-card" data-tip="Set status">${avatarHtml(me, 32, { status: true })}
-      <div class="meta"><div class="n">${esc(me.name)}</div><div class="s">${esc(me.customStatus || STATUS_LABEL[st] || 'Online')}</div></div></div>
+      <div class="meta"><div class="n">${nameHtml(me)}</div><div class="s">${esc(me.customStatus || STATUS_LABEL[st] || 'Online')}</div></div></div>
     <button class="icon-btn ${prefs.muteAll ? 'danger-on' : ''}" id="mute-btn" data-tip="${prefs.muteAll ? 'Unmute notifications' : 'Mute all notifications'}" aria-label="Toggle notifications">${icon(prefs.muteAll ? 'bellOff' : 'bell')}</button>
     <button class="icon-btn" id="settings-btn" data-tip="User Settings" aria-label="Settings">${icon('gear')}</button>`;
   $('#me-card').onclick = (e) => openStatusMenu(e.currentTarget);
@@ -719,6 +786,23 @@ function customStatusDialog() {
   $('#cs-text', m.el).onkeydown = (e) => { if (e.key === 'Enter') save(e.target.value); };
 }
 
+function callButtonHtml(chat, channel) {
+  const c = callButtonState(chat, channel);
+  if (!c) return '';
+  return `<button class="icon-btn ${c.mine ? 'call-on' : c.live ? 'call-live' : ''}" id="h-call" data-act="call" data-tip="${esc(c.tip)}" data-tip-pos="bottom-center" aria-label="${esc(c.tip)}">${PHONE}</button>`;
+}
+
+function refreshCallButton() {
+  const btn = $('#h-call');
+  const { chat, channel } = currentChat();
+  if (!btn || !chat) return;
+  const c = callButtonState(chat, channel);
+  if (!c) return;
+  btn.className = `icon-btn ${c.mine ? 'call-on' : c.live ? 'call-live' : ''}`;
+  btn.dataset.tip = c.tip;
+  btn.setAttribute('aria-label', c.tip);
+}
+
 function renderHeader() {
   const h = $('#main-header');
   const v = state.view;
@@ -738,7 +822,7 @@ function renderHeader() {
     let topic;
     if (chat.type === 'dm') {
       const o = dmOther(chat);
-      title = `<span class="at">@</span>${esc(o ? o.name : 'Unknown')} <span class="status-ico s-${statusOf(o && o.id)}" id="h-status"></span>`;
+      title = `<span class="at">@</span>${o ? nameHtml(o) : 'Unknown'} <span class="status-ico s-${statusOf(o && o.id)}" id="h-status"></span>`;
       topic = o && o.customStatus ? esc(o.customStatus) : '';
     } else {
       title = `<span class="hash">#</span>${esc(channel.name)}`;
@@ -747,6 +831,7 @@ function renderHeader() {
     const rightOn = state.rightPanel === 'search' ? false : prefs.memberList;
     h.innerHTML = `${menuBtn}<div class="h-title">${title}</div>${topic ? `<div class="h-divider"></div><div class="h-topic" title="${topic}">${topic}</div>` : '<div class="h-spacer"></div>'}
       <div class="h-actions">
+        ${callButtonHtml(chat, channel)}
         <button class="icon-btn ${muted ? 'danger-on' : ''}" data-act="mute-chat" data-tip="${muted ? 'Unmute' : 'Mute'} ${chat.type === 'dm' ? 'conversation' : 'group'}" data-tip-pos="bottom-center">${icon(muted ? 'bellOff' : 'bell')}</button>
         <button class="icon-btn" data-act="pins" data-tip="Pinned Messages" data-tip-pos="bottom-center">${icon('pin')}</button>
         <button class="icon-btn ${rightOn ? 'on' : ''}" data-act="toggle-right" data-tip="${chat.type === 'dm' ? 'User Profile' : 'Member List'}" data-tip-pos="bottom-center">${icon(chat.type === 'dm' ? 'person' : 'people')}</button>
@@ -768,6 +853,7 @@ $('#main-header').addEventListener('click', (e) => {
   if (!b) return;
   const { chat } = currentChat();
   if (b.dataset.act === 'new-dm') openNewDM();
+  else if (b.dataset.act === 'call' && chat) toggleCall(state.view.channelId);
   else if (b.dataset.act === 'mute-chat' && chat) toggleChatMute(chat.id);
   else if (b.dataset.act === 'pins') openPins(b);
   else if (b.dataset.act === 'toggle-right') {
@@ -799,7 +885,7 @@ function renderRightPanel() {
     members.forEach((u) => { (['offline', 'invisible'].includes(statusOf(u.id)) ? off : on).push(u); });
     const byName = (a, b) => a.name.localeCompare(b.name);
     const row = (u, offline) => `<div class="member ${offline ? 'offline' : ''}" data-user="${esc(u.id)}">${avatarHtml(u, 32, { status: true })}
-      <div class="meta"><div class="n">${esc(u.name)}${chat.ownerId === u.id ? '<span class="crown" title="Group owner">👑</span>' : ''}</div>${u.customStatus ? `<div class="s">${esc(u.customStatus)}</div>` : ''}</div></div>`;
+      <div class="meta"><div class="n">${nameHtml(u)}${badgesHtml(u)}${chat.ownerId === u.id ? '<span class="crown" title="Group owner">👑</span>' : ''}</div>${u.customStatus ? `<div class="s">${esc(u.customStatus)}</div>` : ''}</div></div>`;
     rp.innerHTML = `<div class="members">
       <div class="side-section"><span>Online — ${on.length}</span></div>${on.sort(byName).map((u) => row(u, false)).join('')}
       ${off.length ? `<div class="side-section"><span>Offline — ${off.length}</span></div>${off.sort(byName).map((u) => row(u, true)).join('')}` : ''}
@@ -852,6 +938,13 @@ function highlightTerms(root, query) {
     });
   });
 }
+
+$('#right-panel').addEventListener('contextmenu', (e) => {
+  const u = e.target.closest('.member[data-user]');
+  if (!u || !state.me.isAdmin) return;
+  e.preventDefault();
+  openMenu({ x: e.clientX, y: e.clientY }, [{ label: 'Manage (Admin)', icon: '🛡️', onClick: () => openAdminUser(u.dataset.user) }], { placement: 'right-start' });
+});
 
 $('#right-panel').addEventListener('click', (e) => {
   const t = e.target;
@@ -906,7 +999,7 @@ function drawPeople() {
   const list = $('#people-list');
   if (!list) return;
   const q = ($('#people-q') || {}).value ? $('#people-q').value.trim().toLowerCase() : '';
-  let users = Array.from(state.users.values()).filter((u) => u.id !== state.me.id);
+  let users = Array.from(state.users.values()).filter((u) => u.id !== state.me.id && !u.banned);
   const isOn = (u) => !['offline', 'invisible'].includes(statusOf(u.id));
   if (state.homeTab === 'online') users = users.filter(isOn);
   if (q) users = users.filter((u) => u.name.toLowerCase().includes(q));
@@ -915,7 +1008,7 @@ function drawPeople() {
   if (!users.length) {
     list.innerHTML = state.homeTab === 'online' && !q
       ? `<div class="empty-state"><div class="art">🌙</div><h3>It's quiet in here…</h3>Nobody else is online right now. Check the <a href="#" data-all>All</a> tab — you can message people even when they're offline.</div>`
-      : `<div class="empty-state"><div class="art">🔍</div><h3>No one found</h3>${state.users.size <= 1 ? 'Nobody else has joined yet. Share the site and the access key with your friends!' : 'Try a different name.'}</div>`;
+      : `<div class="empty-state"><div class="art">🔍</div><h3>No one found</h3>${state.users.size <= 1 ? 'Nobody else has joined yet. An admin can make invites for your friends!' : 'Try a different name.'}</div>`;
     const a = list.querySelector('[data-all]');
     if (a) a.onclick = (e) => { e.preventDefault(); state.homeTab = 'all'; renderHeader(); drawPeople(); };
     return;
@@ -924,7 +1017,7 @@ function drawPeople() {
     const st = statusOf(u.id);
     const sub = u.customStatus || (st === 'offline' ? (u.lastSeen ? 'Last seen ' + ago(u.lastSeen) : 'Offline') : STATUS_LABEL[st]);
     return `<div class="person" data-user="${esc(u.id)}">${avatarHtml(u, 36, { status: true })}
-      <div style="min-width:0"><div class="n">${esc(u.name)}</div><div class="s">${esc(sub)}</div></div>
+      <div style="min-width:0"><div class="n">${nameHtml(u)}${badgesHtml(u)}</div><div class="s">${esc(sub)}</div></div>
       <div class="acts"><button class="round-btn" data-dm="${esc(u.id)}" data-tip="Message">💬</button><button class="round-btn" data-prof="${esc(u.id)}" data-tip="Profile">${icon('more', 18)}</button></div></div>`;
   }).join('');
 }
@@ -999,6 +1092,7 @@ async function renderChannel({ jumpTo } = {}) {
   const channelId = channel.id;
   const placeholder = chat.type === 'dm' ? `Message @${chatName(chat)}` : `Message #${channel.name}`;
   $('#center').innerHTML = `
+    <div id="call-banner" class="hidden" data-channel="${esc(channelId)}"></div>
     <div id="messages-wrap" style="position:relative;flex:1;min-height:0;display:flex;flex-direction:column">
       <div id="messages" class="scroller"><div id="msg-list"><div class="load-more">Loading messages…</div></div></div>
       <div id="unread-bar" class="hidden"></div>
@@ -1022,6 +1116,8 @@ async function renderChannel({ jumpTo } = {}) {
     <div id="typing"></div>`;
   wireComposer(channelId);
   wireMessageList();
+  applyComposerBlock();
+  renderCallUi();
 
   const unread = state.unread.get(channelId);
   state.newMarkerTs = unread && unread.count > 0 ? (state.reads[channelId] || 0) : null;
@@ -1110,7 +1206,12 @@ function renderMessageList() {
     html += messageHtml(m, prev, forceHead ? { head: true } : {});
     prev = m;
   }
+  const loaded = new Map($$('.gif-box.ready', el).map((box) => [box.dataset.gifKey, box]));
   el.innerHTML = html;
+  $$('.gif-box', el).forEach((box) => {
+    const old = loaded.get(box.dataset.gifKey);
+    if (old) box.replaceWith(old);
+  });
   renderSeen();
 }
 
@@ -1139,8 +1240,8 @@ function attachmentsHtml(m) {
     if (u) parts.push(`<img class="legacy-img" src="${esc(u)}" alt="Photo" data-lightbox>`);
   }
   if (m.gif) {
-    const u = mediaUrl(m.gif);
-    if (u) parts.push(`<img class="gif-img" src="${esc(u)}" alt="GIF" loading="lazy" data-lightbox>`);
+    const box = gifBoxHtml(m.gif, m.id);
+    if (box) parts.push(box);
   }
   const atts = m.attachments || [];
   const imgs = atts.filter((a) => fileKind(a.type, a.name) === 'image');
@@ -1213,7 +1314,7 @@ function replyCtxHtml(r) {
 
 function messageHtml(m, prev, opts = {}) {
   if (m.type === 'system') {
-    return `<div class="msg system" data-id="${esc(m.id)}"><div class="gutter">${m.text.includes('pinned') ? '📌' : m.text.includes('left') ? '🚪' : '✨'}</div>
+    return `<div class="msg system" data-id="${esc(m.id)}"><div class="gutter">${m.text.includes('voice call') ? '📞' : m.text.includes('pinned') ? '📌' : m.text.includes('left') ? '🚪' : '✨'}</div>
       <div class="body"><div class="msg-content">${md(m.text)} <span class="msg-time" title="${esc(fullDate(m.ts))}">${esc(msgTimestamp(m.ts))}</span></div></div></div>`;
   }
   const user = getUser(m.senderId) || { id: m.senderId || '?', name: m.senderName || 'Unknown' };
@@ -1225,7 +1326,7 @@ function messageHtml(m, prev, opts = {}) {
   let body = '';
   if (m.replyTo && head) body += replyCtxHtml(m.replyTo);
   if (head) {
-    body += `<div class="msg-head"><span class="msg-author" data-user="${esc(user.id)}">${esc(user.name)}</span><span class="msg-time" title="${esc(fullDate(m.ts))}">${esc(msgTimestamp(m.ts))}</span></div>`;
+    body += `<div class="msg-head"><span class="msg-author" data-user="${esc(user.id)}">${nameHtml(user)}</span>${badgesHtml(user)}<span class="msg-time" title="${esc(fullDate(m.ts))}">${esc(msgTimestamp(m.ts))}</span></div>`;
   }
   if (state.editingId === m.id && !opts.noTools) {
     body += `<div class="edit-box"><textarea rows="1" aria-label="Edit message"></textarea><div class="hint">escape to <a href="#" data-act="cancel-edit">cancel</a> • enter to <a href="#" data-act="save-edit">save</a></div></div>`;
@@ -1302,7 +1403,15 @@ function replaceMessage(m, oldId) {
   const idx = cache ? cache.list.findIndex((x) => x.id === m.id) : -1;
   const prev = idx > 0 ? cache.list[idx - 1] : null;
   const wasBottom = isAtBottom();
+  const gif = node.querySelector('.gif-box.ready');
   node.outerHTML = messageHtml(m, prev, { head: node.classList.contains('head') });
+  // Keep the GIF that's already showing, so sending one doesn't make it blink.
+  const fresh = gif && msgNode(m.id);
+  const box = fresh && fresh.querySelector('.gif-box');
+  if (box) {
+    gif.dataset.gifKey = m.id;
+    box.replaceWith(gif);
+  }
   if (wasBottom) scrollToBottom();
 }
 
@@ -1587,6 +1696,7 @@ function messageMenu(m, anchor) {
   items.push({ label: 'Copy Message Link', icon: '🔗', onClick: async () => { if (await copyText(`${location.origin}${location.pathname}#/c/${chat.id}/${m.channelId}/${m.id}`)) toast('Link copied', 'ok'); } });
   if (!mine) items.push({ label: 'Mark Unread', icon: '🔵', onClick: () => markUnreadFrom(m) });
   if (!mine) items.push({ label: `Message ${userName(m.senderId) || 'them'}`, icon: '💬', onClick: () => openDM(m.senderId) });
+  if (state.me.isAdmin && getUser(m.senderId)) items.push({ label: `Manage ${userName(m.senderId)}`, icon: '🛡️', onClick: () => openAdminUser(m.senderId) });
   if (mine || canManage(chat)) items.push({ sep: true }, { label: 'Delete Message', icon: '🗑️', danger: true, onClick: (ev) => deleteMessage(m, ev && ev.shiftKey) });
   openMenu(anchor, items, { placement: anchor instanceof Element ? 'left-start' : 'right-start', onClose: () => { const n = msgNode(m.id); if (n) n.classList.remove('menu-open'); } });
 }
@@ -2302,7 +2412,7 @@ function connectWS() {
     return;
   }
   const sock = ws;
-  sock.onopen = () => sock.send(JSON.stringify({ type: 'auth', key: session.key, token: session.token, idle: isIdle }));
+  sock.onopen = () => sock.send(JSON.stringify({ type: 'auth', token: session.token, idle: isIdle, pushId: pushDeviceId() }));
   sock.onmessage = (e) => {
     let msg;
     try { msg = JSON.parse(e.data); } catch (err) { return; }
@@ -2313,8 +2423,9 @@ function connectWS() {
     state.connected = false;
     scheduleConnBanner();
     renderUserPanel();
+    if (e.code === 4003) return; // kicked: the page is already reloading
     if (e.code === 4001 || e.code === 4002) {
-      hooks.onUnauthorized(new ApiError(401, '', { error: e.code === 4002 ? 'bad-token' : 'unauthorized' }));
+      hooks.onUnauthorized(new ApiError(401, '', { error: 'bad-token' }));
       return;
     }
     scheduleWs();
@@ -2352,9 +2463,13 @@ async function handleWs(msg) {
       if (b) b.remove();
       state.online = new Map((msg.online || []).map((o) => [o.id, o.status]));
       state.unlocked.forEach((hash, chatId) => wsSend({ type: 'unlock', chatId, passwordHash: hash }));
-      if (everConnected) await resync();
+      if (everConnected) {
+        await resync();
+        onVoiceReconnect();
+      }
       everConnected = true;
       onPresenceChanged();
+      renderCallUi();
       break;
     }
     case 'presence':
@@ -2366,10 +2481,34 @@ async function handleWs(msg) {
       const prev = state.users.get(u.id);
       state.users.set(u.id, u);
       if (state.me && u.id === state.me.id) state.me = Object.assign({}, state.me, u);
-      if (!prev || prev.name !== u.name || prev.avatar !== u.avatar) refreshAll();
+      const looks = (x) => JSON.stringify([x.name, x.avatar, x.look, x.tag, x.role, x.banned]);
+      if (!prev || looks(prev) !== looks(u)) refreshAll();
       else onPresenceChanged();
       break;
     }
+    case 'user:remove':
+      state.users.delete(msg.userId);
+      refreshAll();
+      break;
+    case 'me':
+      setMe(msg.user);
+      break;
+    case 'server:update': {
+      const prev = state.server;
+      state.server = msg.server;
+      renderServerStatus();
+      if (prev.status !== msg.server.status && msg.server.status !== 'online') {
+        toast(`${SERVER_STATUS[msg.server.status].icon} ${SERVER_STATUS[msg.server.status].label}`);
+      }
+      break;
+    }
+    case 'kicked':
+      LS.del('auth_token');
+      setAuthNote(msg.banned
+        ? `This account was removed or banned${msg.reason ? ': ' + msg.reason : '.'}`
+        : `You were signed out by an admin${msg.reason ? ': ' + msg.reason : '.'}`);
+      location.reload();
+      break;
     case 'chat:upsert':
       upsertChat(msg.chat);
       break;
@@ -2392,6 +2531,7 @@ async function handleWs(msg) {
       onRead(msg);
       break;
     default:
+      if (msg.type.startsWith('call:')) handleCallEvent(msg);
   }
 }
 
@@ -2407,6 +2547,7 @@ async function resync() {
   state.messages.forEach((c, id) => { if (id !== v.channelId) state.messages.delete(id); });
   if (v.type === 'chat' && !state.chats.has(v.chatId)) { goHome({ push: false }); return; }
   renderChrome();
+  renderServerStatus();
   if (v.type === 'chat' && $('#msg-list')) {
     const cache = state.messages.get(v.channelId);
     try {
@@ -2595,6 +2736,7 @@ function refreshNotifBanner() {
       if (p === 'granted') {
         prefs.desktop = true;
         savePrefs();
+        setupPush();
         showDesktopNotification({ title: 'Messages', body: "You're all set! You'll get notified about new messages. Mute them any time from the 🔔 button.", icon: avatarIconFor(state.me), tag: 'welcome' });
         toast('🔔 Desktop notifications are on', 'ok');
       } else if (p === 'denied') {
@@ -2666,6 +2808,7 @@ document.addEventListener('keydown', (e) => {
   if (mod && e.key === ',') { e.preventDefault(); openSettings(); return; }
   if (mod && e.shiftKey && e.key.toLowerCase() === 'u') { e.preventDefault(); if (state.view.type === 'chat') $('#file-input').click(); return; }
   if (mod && e.shiftKey && e.key.toLowerCase() === 'd') { e.preventDefault(); setMuteAll(!prefs.muteAll); return; }
+  if (mod && e.shiftKey && e.key.toLowerCase() === 'm') { e.preventDefault(); if (inCall()) toggleMute(); return; }
   if (e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) { e.preventDefault(); moveChannel(e.key === 'ArrowUp' ? -1 : 1); return; }
   if (!mod && !e.altKey && e.key.length === 1 && !hasOpenLayer() && !isEditable(document.activeElement)) {
     const ci = $('#c-input');
@@ -2680,4 +2823,5 @@ window.addEventListener('beforeunload', () => {
   if (v.type === 'chat' && i) { saveDraftNow(v.channelId, i.value); LS.set('drafts', JSON.stringify(drafts)); }
 });
 
+initVoice(wsSend);
 boot();

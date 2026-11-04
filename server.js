@@ -7,7 +7,9 @@
  *   - a small JSON REST API (/api/*) for users, chats, channels, messages
  *   - file uploads (/api/upload) and downloads (/files/:id/:name)
  *   - a WebSocket (/ws) that pushes live events (new messages, typing,
- *     presence, reactions, edits ...) to every connected browser
+ *     presence, reactions, edits ...) to every connected browser, and relays
+ *     WebRTC signalling for voice calls
+ *   - Web Push, so notifications still arrive after every tab is closed
  *   - the static frontend itself (index.html, css/, js/, gifs/)
  *
  * Everything is persisted to a single JSON file (DATA_DIR/data.json) plus an
@@ -15,11 +17,13 @@
  * (write to a temp file, then rename) so a crash mid-write can't corrupt it.
  *
  * Access model:
- *   - SITE_KEY gates the whole app (shared key, same as before).
- *   - Each person additionally gets a personal login token when they first
- *     pick a name. The server uses that token to know who is who, so people
- *     can't post as someone else, and so private groups / DMs are only ever
- *     sent to their members.
+ *   - People log in with a username + password. Passwords are scrypt-hashed.
+ *   - Creating an account needs a token: an invite made in the admin panel,
+ *     SIGNUP_TOKEN (falls back to the old SITE_KEY), or ADMIN_CODE itself.
+ *   - Each login gets its own session token, so one device can be signed out
+ *     without touching the others. Sessions are what kick / ban revoke.
+ *   - ADMIN_CODE turns an account into an admin from Settings -> Admin.
+ *   - Private groups and DMs are only ever sent to their members.
  */
 
 const express = require('express');
@@ -28,11 +32,14 @@ const path = require('path');
 const http = require('http');
 const crypto = require('crypto');
 const { WebSocketServer, WebSocket } = require('ws');
+const webpush = require('web-push');
 
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
-const SITE_KEY = process.env.SITE_KEY || '123456789';
+const LEGACY_DEFAULT_KEY = '123456789';
+const SIGNUP_TOKEN = process.env.SIGNUP_TOKEN ||
+  (process.env.SITE_KEY && process.env.SITE_KEY !== LEGACY_DEFAULT_KEY ? process.env.SITE_KEY : '');
 const PORT = process.env.PORT || 3000;
 // Point DATA_DIR at a persistent volume (e.g. /data on Coolify/Docker) so
 // chats survive restarts. Defaults to the app folder.
@@ -40,7 +47,9 @@ const DATA_DIR = process.env.DATA_DIR || __dirname;
 const DATA_FILE = path.join(DATA_DIR, 'data.json');
 const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
 const MAX_UPLOAD_BYTES = (Number(process.env.MAX_UPLOAD_MB) || 50) * 1024 * 1024;
-const API_VERSION = 2;
+const API_VERSION = 3;
+const DB_VERSION = 3;
+const MAX_CALL_PEERS = 8; // calls are peer-to-peer, so each person uploads to everyone else
 
 const LIMITS = {
   name: 32,
@@ -53,12 +62,22 @@ const LIMITS = {
   text: 4000,
   attachments: 10,
   fileName: 180,
-  pageSize: 50
+  pageSize: 50,
+  username: 24,
+  password: 200,
+  reason: 200,
+  tag: 24,
+  serverMessage: 300,
+  inviteNote: 60
 };
 
-if (SITE_KEY === '123456789') {
-  console.warn('[warn] SITE_KEY is not set — using the insecure default key. Set SITE_KEY in your environment.');
-}
+const USER_STATUSES = ['online', 'idle', 'dnd', 'invisible'];
+const SERVER_STATUSES = ['online', 'announcement', 'degraded', 'readonly', 'maintenance'];
+const LOOK_OPTIONS = {
+  nameFx: ['none', 'glow', 'shimmer', 'rainbow', 'pulse'],
+  nameFont: ['default', 'serif', 'mono', 'rounded', 'hand'],
+  ring: ['none', 'neon', 'gold', 'fire', 'ice', 'rainbow', 'orbit', 'pulse']
+};
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
@@ -101,6 +120,36 @@ function isValidImageRef(v) {
   return v.length < 400000 && DATA_IMG_RE.test(v); // legacy inline avatars
 }
 
+const HEX_RE = /^#[0-9a-f]{6}$/i;
+const hexOrNull = (v) => (typeof v === 'string' && HEX_RE.test(v) ? v : null);
+const pick = (v, allowed) => (allowed.includes(v) ? v : allowed[0]);
+
+// The Nitro-style look of a profile. Everything is whitelisted here so a client
+// can never inject its own CSS into other people's browsers.
+function cleanLook(v) {
+  const l = v && typeof v === 'object' ? v : {};
+  const flair = typeof l.flair === 'string' && /^[\p{Extended_Pictographic}\p{Emoji_Component}\u200d\ufe0f]{1,16}$/u.test(l.flair) ? l.flair : '';
+  return {
+    nameColor: hexOrNull(l.nameColor),
+    nameColor2: hexOrNull(l.nameColor2),
+    nameFx: pick(l.nameFx, LOOK_OPTIONS.nameFx),
+    nameFont: pick(l.nameFont, LOOK_OPTIONS.nameFont),
+    ring: pick(l.ring, LOOK_OPTIONS.ring),
+    ringColor: hexOrNull(l.ringColor),
+    banner: l.banner && isValidImageRef(l.banner) ? l.banner : null,
+    bannerColor2: hexOrNull(l.bannerColor2),
+    themeA: hexOrNull(l.themeA),
+    themeB: hexOrNull(l.themeB),
+    flair
+  };
+}
+
+function cleanTag(v) {
+  if (!v || typeof v !== 'object') return null;
+  const text = cleanOneLine(v.text, LIMITS.tag);
+  return text ? { text, color: hexOrNull(v.color) } : null;
+}
+
 function isValidGif(v) {
   if (typeof v !== 'string' || v.length > 2000) return false;
   return /^https:\/\/raw\.githubusercontent\.com\/[^\s"'<>]+$/.test(v) ||
@@ -111,7 +160,7 @@ function isValidGif(v) {
 // Persistence
 // ---------------------------------------------------------------------------
 function emptyDb() {
-  return { version: API_VERSION, users: {}, chats: {}, messages: {}, files: {} };
+  return { version: DB_VERSION, users: {}, chats: {}, messages: {}, files: {}, settings: {}, invites: {}, push: {}, audit: [] };
 }
 
 // The original app stored everything as loose keys:
@@ -209,11 +258,14 @@ function loadDb() {
     console.error('[error] data.json was unreadable; copied it to', bad, 'and started fresh.');
     return emptyDb();
   }
-  if (parsed && parsed.version === API_VERSION) {
-    const d = Object.assign(emptyDb(), parsed);
-    return d;
+  if (parsed && (parsed.version === DB_VERSION || parsed.version === 2)) {
+    if (parsed.version === 2) {
+      try { fs.writeFileSync(path.join(DATA_DIR, 'data.v2-backup.json'), raw); } catch (e) {}
+      console.log('[migrate] Upgraded data.json to accounts (backup saved to data.v2-backup.json).');
+    }
+    return Object.assign(emptyDb(), parsed, { version: DB_VERSION });
   }
-  // v1 -> v2
+  // v1 -> v3
   const backup = path.join(DATA_DIR, 'data.v1-backup.json');
   try { fs.writeFileSync(backup, raw); } catch (e) {}
   console.log('[migrate] Upgraded data.json from the old format (backup saved to data.v1-backup.json).');
@@ -221,6 +273,44 @@ function loadDb() {
 }
 
 const db = loadDb();
+
+// Fill in fields added since a user / the database was first written. Existing
+// people keep working with their old browser token, which becomes their first
+// session, until they pick a username and password.
+function normalizeUser(u) {
+  if (!Array.isArray(u.sessions)) {
+    u.sessions = u.tokenHash ? [{ hash: u.tokenHash, createdAt: u.createdAt || now() }] : [];
+  }
+  delete u.tokenHash;
+  u.username = u.username || null;
+  u.passwordHash = u.passwordHash || null;
+  u.role = u.role === 'admin' ? 'admin' : 'member';
+  u.look = cleanLook(u.look);
+  u.tag = u.tag || null;
+  u.statusLocked = !!u.statusLocked;
+  u.banned = u.banned || null; // { reason, by, at }
+  u.timeoutUntil = u.timeoutUntil || 0;
+}
+
+Object.values(db.users).forEach(normalizeUser);
+db.settings = db.settings || {};
+db.settings.server = Object.assign({ status: 'online', message: '', updatedAt: 0, signupsOpen: true }, db.settings.server);
+
+const ADMIN_CODE = process.env.ADMIN_CODE || db.settings.generatedAdminCode || crypto.randomBytes(9).toString('base64url');
+if (process.env.ADMIN_CODE) {
+  delete db.settings.generatedAdminCode;
+} else {
+  db.settings.generatedAdminCode = ADMIN_CODE;
+  console.warn(`[admin] ADMIN_CODE is not set. Using a generated code: ${ADMIN_CODE}`);
+}
+
+// Web Push needs a key pair. Generated once and kept with the data, so existing
+// browser subscriptions survive redeploys.
+const vapid = process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY
+  ? { publicKey: process.env.VAPID_PUBLIC_KEY, privateKey: process.env.VAPID_PRIVATE_KEY }
+  : (db.settings.vapid = db.settings.vapid || webpush.generateVAPIDKeys());
+webpush.setVapidDetails(process.env.VAPID_SUBJECT || 'https://messages.zdstudios.network', vapid.publicKey, vapid.privateKey);
+
 let saveTimer = null;
 function saveNow() {
   clearTimeout(saveTimer);
@@ -246,9 +336,71 @@ function shutdown() {
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
-// token hash -> user id
+// token hash -> user id, lower-case username -> user id
 const tokenIndex = new Map();
-Object.values(db.users).forEach((u) => { if (u.tokenHash) tokenIndex.set(u.tokenHash, u.id); });
+const usernameIndex = new Map();
+Object.values(db.users).forEach((u) => {
+  u.sessions.forEach((s) => tokenIndex.set(s.hash, u.id));
+  if (u.username) usernameIndex.set(u.username.toLowerCase(), u.id);
+});
+
+function startSession(user) {
+  const token = crypto.randomBytes(32).toString('base64url');
+  const hash = sha256(token);
+  user.sessions.push({ hash, createdAt: now() });
+  while (user.sessions.length > 20) tokenIndex.delete(user.sessions.shift().hash);
+  tokenIndex.set(hash, user.id);
+  return token;
+}
+
+function revokeSessions(user, keepHash) {
+  user.sessions = user.sessions.filter((s) => {
+    if (s.hash === keepHash) return true;
+    tokenIndex.delete(s.hash);
+    return false;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Passwords
+// ---------------------------------------------------------------------------
+const SCRYPT = { N: 16384, r: 8, p: 1 };
+function scrypt(password, salt) {
+  return new Promise((resolve, reject) => {
+    crypto.scrypt(String(password), salt, 64, SCRYPT, (err, key) => (err ? reject(err) : resolve(key)));
+  });
+}
+async function hashPassword(password) {
+  const salt = crypto.randomBytes(16);
+  const key = await scrypt(password, salt);
+  return `scrypt$${salt.toString('base64')}$${key.toString('base64')}`;
+}
+const DUMMY_HASH = `scrypt$${crypto.randomBytes(16).toString('base64')}$${crypto.randomBytes(64).toString('base64')}`;
+async function verifyPassword(password, stored) {
+  const [, salt, key] = String(stored).split('$');
+  if (!salt || !key) return false;
+  const actual = await scrypt(password, Buffer.from(salt, 'base64'));
+  const expected = Buffer.from(key, 'base64');
+  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+}
+
+const USERNAME_RE = /^[a-z0-9_.-]{3,24}$/i;
+function usernameError(username, forUser) {
+  if (!USERNAME_RE.test(username)) return 'Usernames are 3-24 letters, numbers, dots, dashes or underscores.';
+  const owner = usernameIndex.get(username.toLowerCase());
+  if (owner && owner !== (forUser && forUser.id)) return 'That username is taken.';
+  return null;
+}
+function passwordError(password) {
+  if (typeof password !== 'string' || password.length < 8) return 'Use at least 8 characters for your password.';
+  if (password.length > LIMITS.password) return 'That password is too long.';
+  return null;
+}
+function setUsername(user, username) {
+  if (user.username) usernameIndex.delete(user.username.toLowerCase());
+  user.username = username;
+  usernameIndex.set(username.toLowerCase(), user.id);
+}
 
 // ---------------------------------------------------------------------------
 // Domain helpers
@@ -262,18 +414,26 @@ function publicUser(u) {
     customStatus: u.customStatus || '',
     accent: u.accent || null,
     createdAt: u.createdAt || 0,
-    lastSeen: u.lastSeen || 0
+    lastSeen: u.lastSeen || 0,
+    username: u.username || null,
+    role: u.role || 'member',
+    look: u.look || {},
+    tag: u.tag || null,
+    banned: !!u.banned
   };
 }
+
+const isAdmin = (u) => !!(u && u.role === 'admin');
 
 function canSeeChat(userId, chat) {
   if (!chat) return false;
   if (Array.isArray(chat.memberIds)) return chat.memberIds.includes(userId);
-  return true; // open group: everyone with the site key
+  return true; // open group from before groups became invite-only
 }
 
 function canManageChat(userId, chat) {
   if (chat.type === 'dm') return false;
+  if (isAdmin(db.users[userId])) return true;
   if (!chat.ownerId) return canSeeChat(userId, chat); // legacy / ownerless
   return chat.ownerId === userId;
 }
@@ -418,7 +578,7 @@ app.disable('x-powered-by');
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, PUT, PATCH, DELETE, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Site-Key, Authorization, X-File-Name, X-Chat-Pass');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-File-Name, X-Chat-Pass');
   res.setHeader('Access-Control-Max-Age', '600');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
@@ -445,12 +605,6 @@ setInterval(() => {
   rateBuckets.forEach((b, k) => { if (b.reset < t) rateBuckets.delete(k); });
 }, 60000).unref();
 
-function requireKey(req, res, next) {
-  const key = req.get('X-Site-Key') || '';
-  if (!safeEqual(key, SITE_KEY)) return res.status(401).json({ error: 'unauthorized' });
-  next();
-}
-
 function userFromToken(token) {
   if (typeof token !== 'string' || token.length < 20) return null;
   const id = tokenIndex.get(sha256(token));
@@ -461,12 +615,36 @@ function requireUser(req, res, next) {
   const auth = req.get('Authorization') || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
   const user = userFromToken(token);
-  if (!user) return res.status(401).json({ error: 'bad-token' });
+  if (!user || user.banned) return res.status(401).json({ error: 'bad-token' });
   req.user = user;
+  req.sessionHash = sha256(token);
   next();
 }
 
-const authed = [requireKey, requireUser];
+// During maintenance only admins get through (the client shows a holding screen).
+function requireOpen(req, res, next) {
+  const s = db.settings.server;
+  if (s.status === 'maintenance' && !isAdmin(req.user)) {
+    return res.status(503).json({ error: s.message || 'Messages is down for maintenance.', maintenance: true });
+  }
+  next();
+}
+
+function requireAdmin(req, res, next) {
+  if (!isAdmin(req.user)) return res.status(403).json({ error: 'Admins only.' });
+  next();
+}
+
+const authed = [requireUser, requireOpen];
+const adminOnly = [requireUser, requireAdmin];
+
+// Timeouts and read-only mode both stop someone posting. Returns the reason, or null.
+function postBlock(user) {
+  if (isAdmin(user)) return null;
+  if (db.settings.server.status === 'readonly') return db.settings.server.message || 'Messages is in read-only mode right now.';
+  if (user.timeoutUntil > now()) return `You're timed out until ${new Date(user.timeoutUntil).toLocaleString('en-GB', { timeZone: 'UTC' })} UTC.`;
+  return null;
+}
 
 function getChatFor(req, res) {
   const chat = db.chats[req.params.chatId];
@@ -500,6 +678,8 @@ function getChannelFor(req, res, opts) {
 // Uploads (registered before the JSON body parser so raw bodies stay raw)
 // ---------------------------------------------------------------------------
 app.post('/api/upload', rateLimit('upload', 120, 60000), authed, (req, res) => {
+  const blocked = postBlock(req.user);
+  if (blocked) return res.status(403).json({ error: blocked });
   let name = 'file';
   try { name = decodeURIComponent(req.get('X-File-Name') || 'file'); } catch (e) {}
   name = path.basename(name).replace(/[\u0000-\u001F\u007F/\\?#"'<>%*:|]/g, '_').trim().slice(0, LIMITS.fileName) || 'file';
@@ -575,62 +755,121 @@ app.use(express.json({ limit: '2mb' }));
 // ---------------------------------------------------------------------------
 // Auth + users
 // ---------------------------------------------------------------------------
+function serverView() {
+  const { status, message, updatedAt, signupsOpen } = db.settings.server;
+  return { status, message, updatedAt, signupsOpen };
+}
+
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, api: API_VERSION, maxUploadBytes: MAX_UPLOAD_BYTES });
+  res.json({ ok: true, api: API_VERSION, maxUploadBytes: MAX_UPLOAD_BYTES, server: serverView() });
 });
 
-app.post('/api/auth', rateLimit('auth', 15, 60000), (req, res) => {
-  const key = req.body && req.body.key;
-  if (typeof key === 'string' && safeEqual(key, SITE_KEY)) return res.json({ ok: true, api: API_VERSION });
-  return res.status(401).json({ ok: false });
-});
+// Failed logins per username, on top of the per-IP limit, so one account can't
+// be guessed at from many addresses.
+const loginFails = new Map();
+const LOGIN_FAIL_MAX = 10;
+const LOGIN_FAIL_WINDOW = 15 * 60 * 1000;
+function loginLocked(name) {
+  const f = loginFails.get(name);
+  if (!f || f.until < now()) { loginFails.delete(name); return false; }
+  return f.count >= LOGIN_FAIL_MAX;
+}
+function noteLoginFail(name) {
+  const f = loginFails.get(name);
+  if (!f || f.until < now()) loginFails.set(name, { count: 1, until: now() + LOGIN_FAIL_WINDOW });
+  else f.count++;
+}
 
-app.post('/api/users/register', rateLimit('register', 10, 60000), requireKey, (req, res) => {
-  const body = req.body || {};
-  const name = cleanOneLine(body.name, LIMITS.name);
-  if (!name) return res.status(400).json({ error: 'Please pick a name.' });
-  const avatar = body.avatar === undefined ? null : body.avatar;
-  if (avatar !== null && !isValidImageRef(avatar)) return res.status(400).json({ error: 'That profile picture is not valid.' });
+function findInvite(code) {
+  return Object.values(db.invites).find((i) => safeEqual(i.code, code) && i.used < i.uses) || null;
+}
 
-  const token = crypto.randomBytes(32).toString('base64url');
-  const tokenHash = sha256(token);
-  let user = null;
+function validSignupToken(token) {
+  if (typeof token !== 'string' || !token) return false;
+  return safeEqual(token, ADMIN_CODE) || (!!SIGNUP_TOKEN && safeEqual(token, SIGNUP_TOKEN)) || !!findInvite(token);
+}
 
-  // Old app versions stored a random id in the browser; let that browser claim
-  // its existing identity (once) so its old messages stay "theirs".
-  if (isValidId(body.claimId)) {
-    const existing = db.users[body.claimId];
-    if (existing && !existing.tokenHash) {
-      user = existing;
-      user.name = name;
-      if (avatar) user.avatar = avatar;
-    } else if (!existing) {
-      user = { id: body.claimId };
-    }
+app.post('/api/auth/signup', rateLimit('signup', 10, 60000), async (req, res) => {
+  const b = req.body || {};
+  const token = typeof b.token === 'string' ? b.token.trim() : '';
+  if (!validSignupToken(token)) return res.status(403).json({ error: "That token isn't valid. Ask an admin for one." });
+  if (!db.settings.server.signupsOpen && !safeEqual(token, ADMIN_CODE)) {
+    return res.status(403).json({ error: 'New accounts are switched off right now.' });
   }
-  if (!user) user = { id: newId() };
+  const username = cleanOneLine(b.username, LIMITS.username + 1);
+  const name = cleanOneLine(b.name, LIMITS.name) || username;
+  const uErr = usernameError(username);
+  if (uErr) return res.status(400).json({ error: uErr });
+  const pErr = passwordError(b.password);
+  if (pErr) return res.status(400).json({ error: pErr });
+  const passwordHash = await hashPassword(b.password);
+  // The hash takes a moment; check the username and invite again in case someone got there first.
+  if (usernameIndex.has(username.toLowerCase())) return res.status(400).json({ error: 'That username is taken.' });
+  const invite = findInvite(token);
+  if (!validSignupToken(token)) return res.status(403).json({ error: "That token isn't valid. Ask an admin for one." });
 
-  Object.assign(user, {
-    name,
-    avatar: user.avatar || avatar || null,
-    bio: user.bio || '',
-    customStatus: user.customStatus || '',
-    status: user.status || 'online',
-    accent: user.accent || null,
-    createdAt: user.createdAt || now(),
-    lastSeen: now(),
-    tokenHash,
-    reads: user.reads || {}
-  });
-  db.users[user.id] = user;
-  tokenIndex.set(tokenHash, user.id);
+  // Browsers from the very first version of the app stored a random id; let them
+  // claim it (once) so their old messages stay theirs.
+  let user = null;
+  if (isValidId(b.claimId) && db.users[b.claimId] && !db.users[b.claimId].passwordHash && !db.users[b.claimId].sessions.length) {
+    user = db.users[b.claimId];
+    user.name = name;
+  }
+  if (!user) {
+    user = { id: isValidId(b.claimId) && !db.users[b.claimId] ? b.claimId : newId(), name, avatar: null, bio: '', customStatus: '', status: 'online', accent: null, createdAt: now(), reads: {} };
+    normalizeUser(user);
+    db.users[user.id] = user;
+  }
+  setUsername(user, username);
+  user.passwordHash = passwordHash;
+  user.lastSeen = now();
+  if (invite) invite.used++;
+  const sessionToken = startSession(user);
   scheduleSave();
   broadcast({ type: 'user:update', user: publicUser(user) });
+  res.json({ token: sessionToken, user: meView(user) });
+});
+
+app.post('/api/auth/login', rateLimit('login', 20, 60000), async (req, res) => {
+  const b = req.body || {};
+  const key = cleanOneLine(b.username, LIMITS.username + 1).toLowerCase();
+  const bad = () => res.status(401).json({ error: 'Wrong username or password.' });
+  if (!key || typeof b.password !== 'string' || b.password.length > LIMITS.password) return bad();
+  if (loginLocked(key)) return res.status(429).json({ error: 'Too many failed attempts on this account. Try again in 15 minutes.' });
+  const user = db.users[usernameIndex.get(key)];
+  const ok = await verifyPassword(b.password, (user && user.passwordHash) || DUMMY_HASH);
+  if (!user || !ok) { noteLoginFail(key); return bad(); }
+  loginFails.delete(key);
+  if (user.banned) {
+    return res.status(403).json({ error: `This account is banned${user.banned.reason ? ': ' + user.banned.reason : '.'}`, banned: true });
+  }
+  const token = startSession(user);
+  scheduleSave();
   res.json({ token, user: meView(user) });
 });
 
+app.post('/api/auth/logout', requireUser, (req, res) => {
+  req.user.sessions = req.user.sessions.filter((s) => s.hash !== req.sessionHash);
+  tokenIndex.delete(req.sessionHash);
+  scheduleSave();
+  res.json({ ok: true });
+});
+
 function meView(u) {
-  return Object.assign(publicUser(u), { status: u.status || 'online', reads: u.reads || {} });
+  return Object.assign(publicUser(u), {
+    status: u.status || 'online',
+    reads: u.reads || {},
+    hasPassword: !!u.passwordHash,
+    isAdmin: isAdmin(u),
+    statusLocked: !!u.statusLocked,
+    timeoutUntil: u.timeoutUntil || 0
+  });
+}
+
+// Tell someone's own browsers that their account changed (an admin did something to it).
+function notifyMe(u) {
+  const data = JSON.stringify({ type: 'me', user: meView(u) });
+  clients.forEach((meta, ws) => { if (meta.userId === u.id) send(ws, data); });
 }
 
 app.get('/api/me', authed, (req, res) => res.json({ user: meView(req.user) }));
@@ -638,6 +877,10 @@ app.get('/api/me', authed, (req, res) => res.json({ user: meView(req.user) }));
 app.patch('/api/me', authed, (req, res) => {
   const u = req.user;
   const b = req.body || {};
+  if (u.statusLocked && (b.status !== undefined || b.customStatus !== undefined) && !isAdmin(u)) {
+    const unchanged = (b.status === undefined || b.status === u.status) && (b.customStatus === undefined || cleanOneLine(b.customStatus, LIMITS.customStatus) === u.customStatus);
+    if (!unchanged) return res.status(403).json({ error: 'An admin has locked your status.' });
+  }
   if (b.name !== undefined) {
     const name = cleanOneLine(b.name, LIMITS.name);
     if (!name) return res.status(400).json({ error: 'Name cannot be empty.' });
@@ -651,8 +894,12 @@ app.patch('/api/me', authed, (req, res) => {
   if (b.customStatus !== undefined) u.customStatus = cleanOneLine(b.customStatus, LIMITS.customStatus);
   if (b.accent !== undefined) u.accent = typeof b.accent === 'string' && /^#[0-9a-f]{6}$/i.test(b.accent) ? b.accent : null;
   if (b.status !== undefined) {
-    if (!['online', 'idle', 'dnd', 'invisible'].includes(b.status)) return res.status(400).json({ error: 'Unknown status.' });
+    if (!USER_STATUSES.includes(b.status)) return res.status(400).json({ error: 'Unknown status.' });
     u.status = b.status;
+  }
+  if (b.look !== undefined) {
+    if (b.look && b.look.banner && !isValidImageRef(b.look.banner)) return res.status(400).json({ error: 'That banner image is not valid.' });
+    u.look = cleanLook(b.look);
   }
   scheduleSave();
   broadcast({ type: 'user:update', user: publicUser(u) });
@@ -660,19 +907,57 @@ app.patch('/api/me', authed, (req, res) => {
   res.json({ user: meView(u) });
 });
 
+// Set or change username + password. Old accounts have no password yet, so they
+// can claim one with just their session; after that the current password is needed.
+app.post('/api/me/credentials', rateLimit('credentials', 10, 60000), authed, async (req, res) => {
+  const u = req.user;
+  const b = req.body || {};
+  if (u.passwordHash && !(typeof b.currentPassword === 'string' && await verifyPassword(b.currentPassword, u.passwordHash))) {
+    return res.status(403).json({ error: 'Your current password is wrong.' });
+  }
+  const username = b.username === undefined ? null : cleanOneLine(b.username, LIMITS.username + 1);
+  if (username !== null && username !== u.username) {
+    const err = usernameError(username, u);
+    if (err) return res.status(400).json({ error: err });
+  }
+  if (!u.username && username === null) return res.status(400).json({ error: 'Pick a username.' });
+  if (b.password !== undefined || !u.passwordHash) {
+    const err = passwordError(b.password);
+    if (err) return res.status(400).json({ error: err });
+    u.passwordHash = await hashPassword(b.password);
+    revokeSessions(u, req.sessionHash); // a new password signs out every other device
+  }
+  if (username !== null && username !== u.username) {
+    if (usernameError(username, u)) return res.status(400).json({ error: 'That username is taken.' });
+    setUsername(u, username);
+  }
+  scheduleSave();
+  broadcast({ type: 'user:update', user: publicUser(u) });
+  res.json({ user: meView(u) });
+});
+
+app.post('/api/me/logout-others', authed, (req, res) => {
+  revokeSessions(req.user, req.sessionHash);
+  scheduleSave();
+  res.json({ ok: true });
+});
+
 app.get('/api/users', authed, (req, res) => {
   res.json({ users: Object.values(db.users).map(publicUser) });
 });
 
 // Everything the client needs to start, in one round trip.
-app.get('/api/bootstrap', authed, (req, res) => {
+app.get('/api/bootstrap', requireUser, (req, res) => {
   res.json({
     api: API_VERSION,
     maxUploadBytes: MAX_UPLOAD_BYTES,
     me: meView(req.user),
     users: Object.values(db.users).map(publicUser),
     chats: visibleChatsFor(req.user).map((c) => chatViewFor(c, req.user)),
-    online: presenceList()
+    online: presenceList(),
+    server: serverView(),
+    calls: Array.from(calls.values()).filter((c) => { const f = findChannel(c.channelId); return f && canSeeChat(req.user.id, f.chat); }).map(callView),
+    pushKey: vapid.publicKey
   });
 });
 
@@ -680,6 +965,7 @@ app.get('/api/bootstrap', authed, (req, res) => {
 // Chats + channels
 // ---------------------------------------------------------------------------
 function emitChatUpsert(chat, previouslyVisibleTo) {
+  pruneCalls(chat);
   clients.forEach((meta, ws) => {
     if (!meta.userId) return;
     const user = db.users[meta.userId];
@@ -745,7 +1031,7 @@ app.post('/api/chats', authed, (req, res) => {
     icon: b.icon || null,
     description: cleanStr(b.description, LIMITS.description),
     ownerId: me.id,
-    memberIds: b.private ? cleanMemberIds(b.memberIds, me.id) : null,
+    memberIds: cleanMemberIds(b.memberIds, me.id) || [me.id], // invite-only
     channels: [{ id, name: 'general', topic: '', createdAt: now() }],
     locked,
     passwordHash: locked ? b.passwordHash : null,
@@ -796,7 +1082,8 @@ app.patch('/api/chats/:chatId', authed, (req, res) => {
     }
   }
   if (b.private !== undefined || b.memberIds !== undefined) {
-    const makePrivate = b.private !== undefined ? !!b.private : Array.isArray(chat.memberIds);
+    // Older open groups can become invite-only, but nothing goes the other way.
+    const makePrivate = Array.isArray(chat.memberIds) || !!b.private;
     if (makePrivate) {
       const prev = new Set(chat.memberIds || []);
       chat.memberIds = cleanMemberIds(b.memberIds !== undefined ? b.memberIds : (chat.memberIds || []), me.id);
@@ -813,6 +1100,24 @@ app.patch('/api/chats/:chatId', authed, (req, res) => {
   emitChatUpsert(chat, before);
   notes.forEach((n) => systemMessage(chat, chat.channels[0].id, n, me.id));
   res.json({ chat: chatViewFor(chat, me) });
+});
+
+// Anyone in a group can invite people to it. Removing people stays with the owner.
+app.post('/api/chats/:chatId/members', rateLimit('invite', 60, 60000), authed, (req, res) => {
+  const chat = getChatFor(req, res);
+  if (!chat) return;
+  if (chat.type !== 'group' || !Array.isArray(chat.memberIds)) return res.status(400).json({ error: 'This group is open to everyone already.' });
+  const ids = Array.isArray(req.body && req.body.userIds) ? req.body.userIds : [];
+  const added = ids.filter((id) => isValidId(id) && db.users[id] && !db.users[id].banned && !chat.memberIds.includes(id)).slice(0, 100);
+  if (!added.length) return res.status(400).json({ error: 'Pick someone to invite.' });
+  const before = visibleUserSet(chat);
+  chat.memberIds = Array.from(new Set(chat.memberIds.concat(added))).slice(0, 500);
+  scheduleSave();
+  emitChatUpsert(chat, before);
+  const names = added.slice(0, 5).map((id) => `<@${id}>`).join(', ');
+  const more = added.length > 5 ? ` and ${added.length - 5} more` : '';
+  systemMessage(chat, chat.channels[0].id, `${req.user.name} added ${names}${more} to the group.`, req.user.id);
+  res.json({ chat: chatViewFor(chat, req.user) });
 });
 
 app.post('/api/chats/:chatId/leave', authed, (req, res) => {
@@ -836,6 +1141,7 @@ function deleteChat(chat) {
   const before = visibleUserSet(chat);
   chat.channels.forEach((ch) => { delete db.messages[ch.id]; });
   delete db.chats[chat.id];
+  pruneCalls(chat);
   scheduleSave();
   clients.forEach((meta, ws) => {
     if (meta.userId && before.has(meta.userId)) send(ws, { type: 'chat:remove', chatId: chat.id });
@@ -959,6 +1265,8 @@ app.post('/api/channels/:channelId/messages', rateLimit('send', 120, 60000), aut
   if (!found) return;
   const { chat, channel } = found;
   const me = req.user;
+  const blocked = postBlock(me);
+  if (blocked) return res.status(403).json({ error: blocked });
   const b = req.body || {};
 
   const text = cleanStr(b.text, LIMITS.text);
@@ -1011,6 +1319,7 @@ app.post('/api/channels/:channelId/messages', rateLimit('send', 120, 60000), aut
   emitToChat(chat,
     { type: 'message:new', chatId: chat.id, message: msg, nonce },
     { type: 'message:new', chatId: chat.id, message: redact(msg), nonce });
+  pushMessage(chat, channel, msg);
   res.json({ message: msg, nonce });
 });
 
@@ -1030,6 +1339,8 @@ app.patch('/api/channels/:channelId/messages/:messageId', authed, (req, res) => 
   const f = findMessage(req, res);
   if (!f) return;
   if (f.msg.senderId !== req.user.id || f.msg.type === 'system') return res.status(403).json({ error: 'You can only edit your own messages.' });
+  const blocked = postBlock(req.user);
+  if (blocked) return res.status(403).json({ error: blocked });
   const text = cleanStr(req.body && req.body.text, LIMITS.text);
   if (!text && !(f.msg.attachments && f.msg.attachments.length) && !f.msg.gif && !f.msg.image) {
     return res.status(400).json({ error: 'Message is empty.' });
@@ -1057,6 +1368,8 @@ app.delete('/api/channels/:channelId/messages/:messageId', authed, (req, res) =>
 app.post('/api/channels/:channelId/messages/:messageId/reactions', authed, (req, res) => {
   const f = findMessage(req, res);
   if (!f) return;
+  const blocked = postBlock(req.user);
+  if (blocked) return res.status(403).json({ error: blocked });
   const emoji = typeof req.body.emoji === 'string' ? req.body.emoji.trim() : '';
   if (!emoji || emoji.length > 32 || /[<>"'&\s]/.test(emoji)) return res.status(400).json({ error: 'Bad emoji.' });
   const r = f.msg.reactions = f.msg.reactions || {};
@@ -1143,14 +1456,434 @@ app.get('/api/search', authed, (req, res) => {
 });
 
 // GIFs bundled with the repo (served from /gifs). Avoids GitHub API rate limits.
-app.get('/api/gifs', (req, res) => {
-  fs.readdir(path.join(__dirname, 'gifs'), (err, files) => {
-    if (err) return res.json({ gifs: [] });
-    res.setHeader('Cache-Control', 'public, max-age=300');
-    res.json({
-      gifs: files.filter((f) => /\.gif$/i.test(f)).sort().map((f) => ({ name: f, url: '/gifs/' + encodeURIComponent(f) }))
-    });
+// Width and height come from the GIF header, so the client can reserve the right
+// space before the image arrives instead of the chat jumping when it loads.
+function gifSize(file) {
+  const fd = fs.openSync(path.join(__dirname, 'gifs', file), 'r');
+  try {
+    const head = Buffer.alloc(10);
+    fs.readSync(fd, head, 0, 10, 0);
+    return { w: head.readUInt16LE(6), h: head.readUInt16LE(8) };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+let gifList = null;
+function loadGifList() {
+  if (gifList) return gifList;
+  let files = [];
+  try { files = fs.readdirSync(path.join(__dirname, 'gifs')); } catch (e) {}
+  gifList = files.filter((f) => /\.gif$/i.test(f)).sort().map((f) => {
+    const size = gifSize(f);
+    return { name: f, url: '/gifs/' + encodeURIComponent(f), w: size.w, h: size.h };
   });
+  return gifList;
+}
+
+app.get('/api/gifs', (req, res) => {
+  res.setHeader('Cache-Control', 'public, max-age=300');
+  res.json({ gifs: loadGifList() });
+});
+
+// ---------------------------------------------------------------------------
+// Web Push (notifications with every tab closed)
+// ---------------------------------------------------------------------------
+function cleanPushPrefs(p) {
+  const v = p && typeof p === 'object' ? p : {};
+  const muted = {};
+  Object.keys(v.mutedChats && typeof v.mutedChats === 'object' ? v.mutedChats : {}).slice(0, 500).forEach((id) => { if (isValidId(id)) muted[id] = true; });
+  return { muteAll: !!v.muteAll, mentionsOnly: !!v.mentionsOnly, preview: v.preview !== false, mutedChats: muted };
+}
+
+app.post('/api/push/subscribe', authed, (req, res) => {
+  const b = req.body || {};
+  const sub = b.subscription;
+  if (!sub || typeof sub.endpoint !== 'string' || !/^https:\/\//.test(sub.endpoint) || sub.endpoint.length > 1000 ||
+      !sub.keys || typeof sub.keys.p256dh !== 'string' || typeof sub.keys.auth !== 'string') {
+    return res.status(400).json({ error: 'That push subscription is not valid.' });
+  }
+  const id = sha256(sub.endpoint);
+  db.push[id] = {
+    userId: req.user.id,
+    sub: { endpoint: sub.endpoint, keys: { p256dh: sub.keys.p256dh.slice(0, 200), auth: sub.keys.auth.slice(0, 100) } },
+    origin: typeof b.origin === 'string' && /^https?:\/\/[^\s"'<>]{1,200}$/.test(b.origin) ? b.origin : '',
+    prefs: cleanPushPrefs(b.prefs),
+    createdAt: now()
+  };
+  scheduleSave();
+  res.json({ id });
+});
+
+app.patch('/api/push/:id', authed, (req, res) => {
+  const s = db.push[req.params.id];
+  if (!s || s.userId !== req.user.id) return res.status(404).json({ error: 'Not subscribed.' });
+  s.prefs = cleanPushPrefs(req.body && req.body.prefs);
+  scheduleSave();
+  res.json({ ok: true });
+});
+
+app.delete('/api/push/:id', requireUser, (req, res) => {
+  const s = db.push[req.params.id];
+  if (s && s.userId === req.user.id) { delete db.push[req.params.id]; scheduleSave(); }
+  res.json({ ok: true });
+});
+
+// Lets someone check closed-tab notifications really reach their browser: it
+// waits long enough for them to close the tab first.
+app.post('/api/push/test', rateLimit('push-test', 6, 60000), authed, (req, res) => {
+  const id = typeof (req.body && req.body.id) === 'string' ? req.body.id : '';
+  const s = db.push[id];
+  if (!s || s.userId !== req.user.id) return res.status(404).json({ error: 'This browser is not subscribed yet.' });
+  setTimeout(() => {
+    if (db.push[id]) sendPush(id, db.push[id], { title: 'Messages', body: 'Closed-tab notifications are working! 🎉', tag: 'push-test' }, 'high');
+  }, 10000);
+  res.json({ ok: true });
+});
+
+function sendPush(id, s, payload, urgency) {
+  webpush.sendNotification(s.sub, JSON.stringify(payload), { TTL: 86400, urgency: urgency || 'normal', timeout: 10000 }).catch((err) => {
+    if (err && (err.statusCode === 404 || err.statusCode === 410)) { delete db.push[id]; scheduleSave(); }
+    else console.warn('[push] delivery failed:', err && (err.statusCode || err.message));
+  });
+}
+
+// A device only gets a push if it has no open tab: open tabs notify on their own.
+function liveDevices() {
+  const ids = new Set();
+  clients.forEach((m) => { if (m.pushId) ids.add(m.pushId); });
+  return ids;
+}
+
+function pushIcon(user, s) {
+  return user && user.avatar && user.avatar.startsWith('/files/') && s.origin ? s.origin + user.avatar : undefined;
+}
+
+function plainPreview(text) {
+  return String(text || '')
+    .replace(/<@([A-Za-z0-9_-]{1,64})>/g, (m, id) => '@' + ((db.users[id] || {}).name || 'someone'))
+    .replace(/\|\|[\s\S]*?\|\|/g, '[spoiler]')
+    .replace(/[*_~`]/g, '')
+    .slice(0, 180);
+}
+
+function pushMessage(chat, channel, msg) {
+  const ids = Object.keys(db.push);
+  if (!ids.length) return;
+  const sender = db.users[msg.senderId];
+  const live = liveDevices();
+  ids.forEach((id) => {
+    const s = db.push[id];
+    const u = db.users[s.userId];
+    if (!u || u.id === msg.senderId || live.has(id) || !canSeeChat(u.id, chat) || u.status === 'dnd') return;
+    const p = s.prefs || {};
+    const mention = chat.type === 'dm' || (msg.mentions || []).includes(u.id) || !!msg.mentionsEveryone;
+    if (p.muteAll || (p.mutedChats || {})[chat.id] || (p.mentionsOnly && !mention)) return;
+    const name = sender ? sender.name : 'Someone';
+    let body = 'Sent you a message';
+    if (chat.locked) body = '🔒 New message in a locked group';
+    else if (p.preview !== false) body = plainPreview(previewOf(msg)) || 'Sent an attachment';
+    sendPush(id, s, {
+      title: chat.type === 'dm' ? name : `${name} (#${channel.name}, ${chat.name})`,
+      body,
+      icon: pushIcon(sender, s),
+      tag: channel.id,
+      hash: `#/c/${chat.id}/${channel.id}`
+    }, mention ? 'high' : 'normal');
+  });
+}
+
+function pushCall(chat, channel, caller) {
+  const live = liveDevices();
+  Object.keys(db.push).forEach((id) => {
+    const s = db.push[id];
+    const u = db.users[s.userId];
+    if (!u || u.id === caller.id || live.has(id) || !canSeeChat(u.id, chat) || u.status === 'dnd') return;
+    const p = s.prefs || {};
+    if (p.muteAll || (p.mutedChats || {})[chat.id] || (chat.type !== 'dm' && p.mentionsOnly)) return;
+    sendPush(id, s, {
+      title: chat.type === 'dm' ? `📞 ${caller.name} is calling you` : `📞 ${caller.name} started a call`,
+      body: chat.type === 'dm' ? 'Click to open the chat and join' : `#${channel.name} in ${chat.name}`,
+      icon: pushIcon(caller, s),
+      tag: 'call-' + channel.id,
+      hash: `#/c/${chat.id}/${channel.id}`,
+      sticky: true
+    }, 'high');
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Voice: ICE servers for WebRTC. The audio goes directly between browsers, and
+// falls back to the TURN relay when a network blocks that.
+// ---------------------------------------------------------------------------
+app.get('/api/voice/config', authed, (req, res) => {
+  const iceServers = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] }];
+  const urls = (process.env.TURN_URLS || '').split(',').map((u) => u.trim()).filter(Boolean);
+  if (urls.length && process.env.TURN_SECRET) {
+    // Short-lived credentials, the coturn "use-auth-secret" scheme.
+    const username = `${Math.floor(now() / 1000) + 12 * 3600}:${req.user.id}`;
+    const credential = crypto.createHmac('sha1', process.env.TURN_SECRET).update(username).digest('base64');
+    iceServers.push({ urls, username, credential });
+  } else if (urls.length && process.env.TURN_USERNAME) {
+    iceServers.push({ urls, username: process.env.TURN_USERNAME, credential: process.env.TURN_CREDENTIAL || '' });
+  }
+  res.json({ iceServers, maxPeers: MAX_CALL_PEERS, relay: urls.length > 0 });
+});
+
+// ---------------------------------------------------------------------------
+// Admin
+// ---------------------------------------------------------------------------
+function audit(actor, action, detail) {
+  db.audit.push({ id: newId(), ts: now(), actorId: actor.id, actorName: actor.name, action, detail: String(detail || '').slice(0, 200) });
+  if (db.audit.length > 300) db.audit.splice(0, db.audit.length - 300);
+  scheduleSave();
+}
+
+function adminUserView(u) {
+  return Object.assign(publicUser(u), {
+    status: u.status || 'online',
+    statusLocked: !!u.statusLocked,
+    timeoutUntil: u.timeoutUntil || 0,
+    bannedInfo: u.banned || null,
+    sessions: u.sessions.length,
+    hasPassword: !!u.passwordHash,
+    pushDevices: Object.values(db.push).filter((s) => s.userId === u.id).length
+  });
+}
+
+function storageBytes() {
+  return Object.values(db.files).reduce((n, f) => n + (f.size || 0), 0);
+}
+
+app.post('/api/admin/claim', rateLimit('admin-claim', 6, 60000), authed, (req, res) => {
+  const code = req.body && req.body.code;
+  if (typeof code !== 'string' || !safeEqual(code.trim(), ADMIN_CODE)) {
+    return res.status(403).json({ error: "That admin code isn't right." });
+  }
+  req.user.role = 'admin';
+  audit(req.user, 'became an admin');
+  broadcast({ type: 'user:update', user: publicUser(req.user) });
+  res.json({ user: meView(req.user) });
+});
+
+app.post('/api/admin/resign', adminOnly, (req, res) => {
+  req.user.role = 'member';
+  audit(req.user, 'stepped down as admin');
+  broadcast({ type: 'user:update', user: publicUser(req.user) });
+  res.json({ user: meView(req.user) });
+});
+
+app.get('/api/admin/overview', adminOnly, (req, res) => {
+  const groups = Object.values(db.chats).filter((c) => c.type === 'group').map((c) => ({
+    id: c.id,
+    name: c.name,
+    icon: c.icon || null,
+    ownerId: c.ownerId || null,
+    private: Array.isArray(c.memberIds),
+    members: Array.isArray(c.memberIds) ? c.memberIds.length : null,
+    locked: !!c.locked,
+    channels: c.channels.length,
+    messages: c.channels.reduce((n, ch) => n + (db.messages[ch.id] || []).length, 0),
+    lastMessageAt: c.lastMessageAt || c.createdAt
+  }));
+  res.json({
+    server: serverView(),
+    users: Object.values(db.users).map(adminUserView),
+    groups,
+    invites: Object.values(db.invites).sort((a, b) => b.createdAt - a.createdAt),
+    audit: db.audit.slice().reverse(),
+    stats: {
+      users: Object.keys(db.users).length,
+      online: presenceList().length,
+      groups: groups.length,
+      messages: Object.values(db.messages).reduce((n, l) => n + l.length, 0),
+      files: Object.keys(db.files).length,
+      storageBytes: storageBytes(),
+      calls: calls.size,
+      pushDevices: Object.keys(db.push).length
+    },
+    voice: { relay: !!process.env.TURN_URLS },
+    signupTokenSet: !!SIGNUP_TOKEN
+  });
+});
+
+app.patch('/api/admin/server', adminOnly, (req, res) => {
+  const b = req.body || {};
+  const s = db.settings.server;
+  if (b.status !== undefined) {
+    if (!SERVER_STATUSES.includes(b.status)) return res.status(400).json({ error: 'Unknown server status.' });
+    s.status = b.status;
+  }
+  if (b.message !== undefined) s.message = cleanStr(b.message, LIMITS.serverMessage);
+  if (b.signupsOpen !== undefined) s.signupsOpen = !!b.signupsOpen;
+  s.updatedAt = now();
+  audit(req.user, 'set the server status', `${s.status}${s.message ? ': ' + s.message : ''}${s.signupsOpen ? '' : ' (signups off)'}`);
+  broadcast({ type: 'server:update', server: serverView() });
+  res.json({ server: serverView() });
+});
+
+function adminTarget(req, res) {
+  const u = db.users[req.params.userId];
+  if (!u) { res.status(404).json({ error: 'That person no longer exists.' }); return null; }
+  return u;
+}
+
+function targetOther(req, res) {
+  const u = adminTarget(req, res);
+  if (u && u.id === req.user.id) { res.status(400).json({ error: "You can't do that to yourself." }); return null; }
+  return u;
+}
+
+function dropSockets(user, reason, banned) {
+  const data = JSON.stringify({ type: 'kicked', reason: reason || '', banned: !!banned });
+  clients.forEach((meta, ws) => {
+    if (meta.userId !== user.id) return;
+    send(ws, data);
+    ws.close(4003, 'kicked');
+  });
+}
+
+app.patch('/api/admin/users/:userId', adminOnly, (req, res) => {
+  const u = adminTarget(req, res);
+  if (!u) return;
+  const b = req.body || {};
+  const notes = [];
+  if (b.status !== undefined) {
+    if (!USER_STATUSES.includes(b.status)) return res.status(400).json({ error: 'Unknown status.' });
+    u.status = b.status;
+    notes.push('status: ' + b.status);
+  }
+  if (b.customStatus !== undefined) {
+    u.customStatus = cleanOneLine(b.customStatus, LIMITS.customStatus);
+    notes.push(`custom status: "${u.customStatus}"`);
+  }
+  if (b.statusLocked !== undefined) { u.statusLocked = !!b.statusLocked; notes.push(u.statusLocked ? 'status locked' : 'status unlocked'); }
+  if (b.name !== undefined) {
+    const name = cleanOneLine(b.name, LIMITS.name);
+    if (!name) return res.status(400).json({ error: 'Name cannot be empty.' });
+    u.name = name;
+    notes.push('name: ' + name);
+  }
+  if (b.tag !== undefined) { u.tag = cleanTag(b.tag); notes.push(u.tag ? 'tag: ' + u.tag.text : 'tag removed'); }
+  if (b.role !== undefined) {
+    if (u.id === req.user.id) return res.status(400).json({ error: "Use 'Step down' to change your own role." });
+    u.role = b.role === 'admin' ? 'admin' : 'member';
+    notes.push(u.role === 'admin' ? 'made admin' : 'removed admin');
+  }
+  if (b.timeoutMinutes !== undefined) {
+    if (u.id === req.user.id) return res.status(400).json({ error: "You can't time yourself out." });
+    const mins = Math.max(0, Math.min(60 * 24 * 28, Number(b.timeoutMinutes) || 0));
+    u.timeoutUntil = mins ? now() + mins * 60000 : 0;
+    notes.push(mins ? `timed out for ${mins} min` : 'timeout removed');
+  }
+  audit(req.user, `updated ${u.name}`, notes.join(', '));
+  broadcast({ type: 'user:update', user: publicUser(u) });
+  broadcastPresence();
+  notifyMe(u);
+  res.json({ user: adminUserView(u) });
+});
+
+app.post('/api/admin/users/:userId/kick', adminOnly, (req, res) => {
+  const u = targetOther(req, res);
+  if (!u) return;
+  const reason = cleanOneLine(req.body && req.body.reason, LIMITS.reason);
+  revokeSessions(u);
+  scheduleSave();
+  dropSockets(u, reason, false);
+  audit(req.user, `kicked ${u.name}`, reason);
+  res.json({ user: adminUserView(u) });
+});
+
+app.post('/api/admin/users/:userId/ban', adminOnly, (req, res) => {
+  const u = targetOther(req, res);
+  if (!u) return;
+  const reason = cleanOneLine(req.body && req.body.reason, LIMITS.reason);
+  u.banned = { reason, by: req.user.id, at: now() };
+  revokeSessions(u);
+  scheduleSave();
+  dropSockets(u, reason, true);
+  audit(req.user, `banned ${u.name}`, reason);
+  broadcast({ type: 'user:update', user: publicUser(u) });
+  res.json({ user: adminUserView(u) });
+});
+
+app.post('/api/admin/users/:userId/unban', adminOnly, (req, res) => {
+  const u = adminTarget(req, res);
+  if (!u) return;
+  u.banned = null;
+  audit(req.user, `unbanned ${u.name}`);
+  broadcast({ type: 'user:update', user: publicUser(u) });
+  res.json({ user: adminUserView(u) });
+});
+
+// No email in this app, so a forgotten password is fixed by an admin. Also how an
+// old account that lost its browser token gets a login again.
+app.post('/api/admin/users/:userId/reset-password', adminOnly, async (req, res) => {
+  const u = adminTarget(req, res);
+  if (!u) return;
+  const username = cleanOneLine(req.body && req.body.username, LIMITS.username + 1);
+  if (!u.username && !username) return res.status(400).json({ error: 'Give this account a username first.' });
+  if (username && username !== u.username) {
+    const err = usernameError(username, u);
+    if (err) return res.status(400).json({ error: err });
+  }
+  const password = crypto.randomBytes(9).toString('base64url');
+  u.passwordHash = await hashPassword(password);
+  if (username && username !== u.username) setUsername(u, username);
+  revokeSessions(u, u.id === req.user.id ? req.sessionHash : null);
+  scheduleSave();
+  if (u.id !== req.user.id) dropSockets(u, 'An admin reset your password.', false);
+  audit(req.user, `reset the password of ${u.name}`);
+  res.json({ user: adminUserView(u), username: u.username, password });
+});
+
+app.delete('/api/admin/users/:userId', adminOnly, (req, res) => {
+  const u = targetOther(req, res);
+  if (!u) return;
+  revokeSessions(u);
+  dropSockets(u, 'Your account was deleted.', true);
+  if (u.username) usernameIndex.delete(u.username.toLowerCase());
+  Object.keys(db.push).forEach((id) => { if (db.push[id].userId === u.id) delete db.push[id]; });
+  Object.values(db.chats).forEach((c) => {
+    if (c.type === 'group' && Array.isArray(c.memberIds) && c.memberIds.includes(u.id)) {
+      c.memberIds = c.memberIds.filter((id) => id !== u.id);
+    }
+    if (c.ownerId === u.id) c.ownerId = Array.isArray(c.memberIds) ? c.memberIds[0] || null : null;
+  });
+  delete db.users[u.id];
+  scheduleSave();
+  audit(req.user, `deleted the account of ${u.name}`);
+  broadcast({ type: 'user:remove', userId: u.id });
+  res.json({ ok: true });
+});
+
+app.delete('/api/admin/chats/:chatId', adminOnly, (req, res) => {
+  const chat = db.chats[req.params.chatId];
+  if (!chat || chat.type !== 'group') return res.status(404).json({ error: 'Group not found.' });
+  audit(req.user, `deleted the group ${chat.name}`);
+  deleteChat(chat);
+  res.json({ ok: true });
+});
+
+app.post('/api/admin/invites', adminOnly, (req, res) => {
+  const b = req.body || {};
+  const invite = {
+    id: newId(),
+    code: crypto.randomBytes(6).toString('hex'),
+    note: cleanOneLine(b.note, LIMITS.inviteNote),
+    uses: Math.max(1, Math.min(500, Math.floor(Number(b.uses)) || 1)),
+    used: 0,
+    createdBy: req.user.name,
+    createdAt: now()
+  };
+  db.invites[invite.id] = invite;
+  audit(req.user, 'made an invite', invite.note);
+  res.json({ invite });
+});
+
+app.delete('/api/admin/invites/:id', adminOnly, (req, res) => {
+  if (db.invites[req.params.id]) { delete db.invites[req.params.id]; audit(req.user, 'revoked an invite'); }
+  res.json({ ok: true });
 });
 
 app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
@@ -1158,7 +1891,7 @@ app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
 // ---------------------------------------------------------------------------
 // Static frontend (only the public bits — never data.json, uploads, or code)
 // ---------------------------------------------------------------------------
-const staticOpts = { maxAge: '1h', dotfiles: 'ignore', index: false };
+const staticOpts = { maxAge: 0, dotfiles: 'ignore', index: false };
 app.use('/css', express.static(path.join(__dirname, 'css'), staticOpts));
 app.use('/js', express.static(path.join(__dirname, 'js'), staticOpts));
 app.use('/gifs', express.static(path.join(__dirname, 'gifs'), { maxAge: '7d', dotfiles: 'ignore', index: false }));
@@ -1175,7 +1908,7 @@ app.use((req, res) => {
 // ---------------------------------------------------------------------------
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 64 * 1024 });
-const clients = new Map(); // ws -> { userId, idle, unlocked:Set<chatId> }
+const clients = new Map(); // ws -> { userId, idle, unlocked:Set<chatId>, pushId, peerId, callId }
 
 function send(ws, msg) {
   if (ws.readyState !== WebSocket.OPEN) return;
@@ -1220,6 +1953,88 @@ function presenceList() {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Voice calls. One call per channel; the server only introduces the browsers
+// and passes their WebRTC signalling around. Audio never touches this server.
+// ---------------------------------------------------------------------------
+const calls = new Map(); // channelId -> { channelId, chatId, startedAt, startedBy, peers: Map<peerId, peer> }
+
+function callView(call) {
+  return {
+    channelId: call.channelId,
+    chatId: call.chatId,
+    startedAt: call.startedAt,
+    startedBy: call.startedBy,
+    peers: Array.from(call.peers.values()).map((p) => ({ peerId: p.peerId, userId: p.userId, muted: p.muted, deafened: p.deafened }))
+  };
+}
+
+function emitCall(call) {
+  const found = findChannel(call.channelId);
+  if (!found) return;
+  const data = JSON.stringify(call.peers.size ? { type: 'call:update', call: callView(call) } : { type: 'call:end', channelId: call.channelId });
+  clients.forEach((meta, ws) => { if (meta.userId && canSeeChat(meta.userId, found.chat)) send(ws, data); });
+}
+
+function leaveCall(ws, meta) {
+  const call = meta.callId && calls.get(meta.callId);
+  meta.callId = null;
+  if (!call) return;
+  call.peers.delete(meta.peerId);
+  if (!call.peers.size) calls.delete(call.channelId);
+  emitCall(call);
+}
+
+function joinCall(ws, meta, user, channelId) {
+  const found = findChannel(channelId);
+  if (!found || !canSeeChat(user.id, found.chat)) return send(ws, { type: 'call:error', error: "You can't join that call." });
+  const { chat, channel } = found;
+  if (chat.locked && !meta.unlocked.has(chat.id)) return send(ws, { type: 'call:error', error: 'Unlock the group first.' });
+  if (meta.callId) leaveCall(ws, meta);
+  let call = calls.get(channelId);
+  const starting = !call;
+  // Joining from a second tab or device moves you there.
+  if (call) {
+    call.peers.forEach((p) => {
+      if (p.userId === user.id) {
+        send(p.ws, { type: 'call:moved' });
+        leaveCall(p.ws, clients.get(p.ws));
+      }
+    });
+    call = calls.get(channelId);
+  }
+  if (!call) {
+    call = { channelId, chatId: chat.id, startedAt: now(), startedBy: user.id, peers: new Map() };
+    calls.set(channelId, call);
+  }
+  if (call.peers.size >= MAX_CALL_PEERS) return send(ws, { type: 'call:error', error: `That call is full (${MAX_CALL_PEERS} people max).` });
+  const existing = callView(call).peers;
+  meta.peerId = newId();
+  meta.callId = channelId;
+  call.peers.set(meta.peerId, { peerId: meta.peerId, userId: user.id, ws, muted: false, deafened: false });
+  send(ws, { type: 'call:joined', channelId, chatId: chat.id, peerId: meta.peerId, peers: existing });
+  emitCall(call);
+  if (starting) {
+    systemMessage(chat, channelId, `${user.name} started a voice call.`, user.id);
+    const ring = JSON.stringify({ type: 'call:ring', channelId, chatId: chat.id, fromId: user.id });
+    clients.forEach((m2, ws2) => { if (m2.userId && m2.userId !== user.id && canSeeChat(m2.userId, chat)) send(ws2, ring); });
+    pushCall(chat, channel, user);
+    scheduleSave();
+  }
+}
+
+// Someone removed from a private group shouldn't stay on its call.
+function pruneCalls(chat) {
+  calls.forEach((call) => {
+    if (call.chatId !== chat.id) return;
+    call.peers.forEach((p) => {
+      if (canSeeChat(p.userId, chat) && db.chats[chat.id]) return;
+      send(p.ws, { type: 'call:removed' });
+      leaveCall(p.ws, clients.get(p.ws));
+    });
+  });
+}
+
 let presenceTimer = null;
 function broadcastPresence() {
   if (presenceTimer) return;
@@ -1230,7 +2045,7 @@ function broadcastPresence() {
 }
 
 wss.on('connection', (ws) => {
-  const meta = { userId: null, idle: false, unlocked: new Set() };
+  const meta = { userId: null, idle: false, unlocked: new Set(), pushId: null, peerId: null, callId: null };
   clients.set(ws, meta);
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
@@ -1244,12 +2059,12 @@ wss.on('connection', (ws) => {
     if (!msg || typeof msg.type !== 'string') return;
 
     if (msg.type === 'auth') {
-      if (typeof msg.key !== 'string' || !safeEqual(msg.key, SITE_KEY)) return ws.close(4001, 'unauthorized');
       const user = userFromToken(msg.token);
-      if (!user) return ws.close(4002, 'bad-token');
+      if (!user || user.banned) return ws.close(4002, 'bad-token');
       clearTimeout(authTimeout);
       meta.userId = user.id;
       meta.idle = !!msg.idle;
+      if (typeof msg.pushId === 'string' && /^[a-f0-9]{64}$/.test(msg.pushId)) meta.pushId = msg.pushId;
       send(ws, { type: 'ready', online: presenceList() });
       broadcastPresence();
       return;
@@ -1274,12 +2089,40 @@ wss.on('connection', (ws) => {
           typeof msg.passwordHash === 'string' && safeEqual(msg.passwordHash, chat.passwordHash)) {
         meta.unlocked.add(chat.id);
       }
+    } else if (msg.type === 'push-id') {
+      meta.pushId = typeof msg.id === 'string' && /^[a-f0-9]{64}$/.test(msg.id) ? msg.id : null;
+    } else if (msg.type === 'call:join' && typeof msg.channelId === 'string') {
+      joinCall(ws, meta, user, msg.channelId);
+    } else if (msg.type === 'call:leave') {
+      leaveCall(ws, meta);
+    } else if (msg.type === 'call:state') {
+      const call = calls.get(meta.callId);
+      const peer = call && call.peers.get(meta.peerId);
+      if (peer) {
+        peer.muted = !!msg.muted;
+        peer.deafened = !!msg.deafened;
+        emitCall(call);
+      }
+    } else if (msg.type === 'call:signal' && typeof msg.to === 'string') {
+      // Only relays between two people in the same call.
+      const call = calls.get(meta.callId);
+      const target = call && call.peers.get(msg.to);
+      if (target) send(target.ws, { type: 'call:signal', from: meta.peerId, userId: user.id, data: msg.data });
+    } else if (msg.type === 'call:decline' && typeof msg.channelId === 'string') {
+      const call = calls.get(msg.channelId);
+      if (call && findChannel(msg.channelId) && canSeeChat(user.id, findChannel(msg.channelId).chat)) {
+        call.peers.forEach((p) => send(p.ws, { type: 'call:declined', channelId: msg.channelId, userId: user.id }));
+        clients.forEach((m2, ws2) => {
+          if (ws2 !== ws && m2.userId === user.id) send(ws2, { type: 'call:stop-ring', channelId: msg.channelId });
+        });
+      }
     }
   });
 
   ws.on('close', () => {
     clearTimeout(authTimeout);
     const uid = meta.userId;
+    leaveCall(ws, meta);
     clients.delete(ws);
     if (uid) {
       const stillOnline = Array.from(clients.values()).some((m) => m.userId === uid);
@@ -1303,4 +2146,5 @@ wss.on('close', () => clearInterval(heartbeat));
 
 server.listen(PORT, () => {
   console.log(`Messages server listening on port ${PORT} (data: ${DATA_FILE})`);
+  if (!SIGNUP_TOKEN) console.warn('[admin] SIGNUP_TOKEN is not set. New accounts need ADMIN_CODE or an invite from the admin panel.');
 });

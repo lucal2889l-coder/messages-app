@@ -1,8 +1,8 @@
 // Desktop notifications (Windows / macOS toasts via the browser), sounds,
 // and the tab title / favicon unread badge.
 import { colorFor, initials } from './util.js';
-import { mediaUrl } from './api.js';
-
+import { api, mediaUrl } from './api.js';
+import { SERVER_ORIGIN } from './config.js';
 
 export async function registerServiceWorker() {
   if (!('serviceWorker' in navigator) || !window.isSecureContext) return null;
@@ -24,6 +24,61 @@ export async function requestNotifPermission() {
     // very old Safari uses the callback form
     return new Promise((resolve) => Notification.requestPermission(resolve));
   }
+}
+
+// ---- Push: lets the browser show notifications with every tab closed ----
+export const pushSupported = () => 'serviceWorker' in navigator && 'PushManager' in window && window.isSecureContext;
+
+function keyBytes(base64url) {
+  const b64 = base64url.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(base64url.length / 4) * 4, '=');
+  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+}
+
+function sameKey(buffer, bytes) {
+  if (!buffer) return false;
+  const a = new Uint8Array(buffer);
+  return a.length === bytes.length && a.every((v, i) => v === bytes[i]);
+}
+
+async function swReady() {
+  const reg = await Promise.race([navigator.serviceWorker.ready, new Promise((r) => setTimeout(() => r(null), 4000))]);
+  return reg && reg.pushManager ? reg : null;
+}
+
+// Subscribes this browser (once) and tells the server. Returns the device id.
+export async function syncPush(publicKey, pushPrefs) {
+  if (!pushSupported() || notifPermission() !== 'granted' || !publicKey) return null;
+  const reg = await swReady();
+  if (!reg) return null;
+  const key = keyBytes(publicKey);
+  let sub = await reg.pushManager.getSubscription();
+  if (sub && !sameKey(sub.options.applicationServerKey, key)) {
+    await sub.unsubscribe();
+    sub = null;
+  }
+  if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+  const res = await api('POST', '/api/push/subscribe', { subscription: sub.toJSON(), origin: SERVER_ORIGIN, prefs: pushPrefs });
+  try { localStorage.setItem('push_id', res.id); } catch (e) {}
+  return res.id;
+}
+
+export function pushDeviceId() {
+  try { return localStorage.getItem('push_id'); } catch (e) { return null; }
+}
+
+export async function updatePushPrefs(pushPrefs) {
+  const id = pushDeviceId();
+  if (id) await api('PATCH', `/api/push/${id}`, { prefs: pushPrefs }, { quiet: true });
+}
+
+export async function disablePush() {
+  const id = pushDeviceId();
+  try { localStorage.removeItem('push_id'); } catch (e) {}
+  if (id) await api('DELETE', `/api/push/${id}`, undefined, { quiet: true }).catch(() => {});
+  if (!pushSupported()) return;
+  const reg = await swReady();
+  const sub = reg && await reg.pushManager.getSubscription();
+  if (sub) await sub.unsubscribe().catch(() => {});
 }
 
 const iconCache = new Map();
@@ -52,9 +107,9 @@ export function avatarIconFor(user) {
 
 // Show a system notification. Prefers the service worker (better Windows
 // integration + clicking it focuses the tab); falls back to `new Notification`.
-export async function showDesktopNotification({ title, body, icon, tag, hash, onClick }) {
+export async function showDesktopNotification({ title, body, icon, tag, hash, onClick, sticky = false }) {
   if (notifPermission() !== 'granted') return false;
-  const opts = { body, icon, tag, renotify: !!tag, silent: true, data: { hash: hash || '' } };
+  const opts = { body, icon, tag, renotify: !!tag, silent: true, requireInteraction: sticky, data: { hash: hash || '' } };
   try {
     // Wait (briefly) for the service worker to be active — showNotification
     // throws on a registration that hasn't finished installing.
@@ -89,7 +144,13 @@ export function playSound(kind = 'message') {
     if (!audioCtx) unlockAudio();
     if (!audioCtx) return;
     const t = audioCtx.currentTime;
-    const notes = kind === 'mention' ? [784, 1047, 1319] : kind === 'test' ? [660, 880] : [880, 1175];
+    const notes = {
+      mention: [784, 1047, 1319],
+      test: [660, 880],
+      join: [523, 784],
+      leave: [784, 523],
+      ring: [659, 784, 659, 784]
+    }[kind] || [880, 1175];
     notes.forEach((freq, i) => {
       const o = audioCtx.createOscillator();
       const g = audioCtx.createGain();
@@ -104,6 +165,17 @@ export function playSound(kind = 'message') {
       o.stop(start + 0.25);
     });
   } catch (e) {}
+}
+
+let ringTimer = null;
+export function startRing() {
+  if (ringTimer) return;
+  playSound('ring');
+  ringTimer = setInterval(() => playSound('ring'), 2600);
+}
+export function stopRing() {
+  clearInterval(ringTimer);
+  ringTimer = null;
 }
 
 // ---- Tab badge ----

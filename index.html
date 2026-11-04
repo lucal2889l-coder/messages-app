@@ -31,24 +31,19 @@
   </div>
 </div>
 
-<!-- Site access key -->
-<div id="gate-screen" class="screen hidden">
-  <form class="auth-card" id="gate-form" autocomplete="off">
-    <img class="auth-logo" src="icon.svg" alt="">
-    <h1>Welcome back!</h1>
-    <p>This app is private. Enter the access key to continue.</p>
-    <div class="field">
-      <label class="label" for="gate-key">Access key <span class="req">*</span></label>
-      <input id="gate-key" class="input" type="password" autocomplete="off" required>
-      <div class="error" id="gate-error"></div>
-    </div>
-    <button class="btn block" id="gate-submit" type="submit">Continue</button>
-  </form>
+<!-- Log in / create an account -->
+<div id="auth-screen" class="screen hidden">
+  <form class="auth-card" id="auth-form"></form>
 </div>
 
-<!-- Pick a name / sign in with a login code -->
-<div id="onboard-screen" class="screen hidden">
-  <form class="auth-card" id="onboard-form" autocomplete="off"></form>
+<!-- Holding screen while the server is in maintenance -->
+<div id="maint-screen" class="screen hidden">
+  <div class="auth-card">
+    <div class="maint-ico">🛠️</div>
+    <h1>Down for maintenance</h1>
+    <p id="maint-msg">Messages will be back soon.</p>
+    <div class="boot-spinner"></div>
+  </div>
 </div>
 
 <div id="app" class="hidden">
@@ -56,9 +51,11 @@
   <aside id="sidebar">
     <div id="sidebar-header"></div>
     <div id="sidebar-body" class="scroller thin"></div>
+    <div id="voice-panel" class="hidden"></div>
     <div id="user-panel"></div>
   </aside>
   <main id="main">
+    <div id="server-banner" class="hidden"></div>
     <div id="notif-banner" class="hidden"></div>
     <header id="main-header"></header>
     <div id="main-body">
@@ -72,6 +69,7 @@
 <div id="layer"></div>
 <div id="modal-root"></div>
 <div id="toasts" role="status" aria-live="polite"></div>
+<div id="audio-sink" hidden></div>
 <input type="file" id="file-input" multiple hidden>
 <input type="file" id="folder-input" webkitdirectory directory multiple hidden>
 <input type="file" id="image-input" accept="image/png,image/jpeg,image/gif,image/webp" hidden>

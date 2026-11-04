@@ -3,8 +3,8 @@
 import { $, $$, esc, fmtSize, copyText, ago, langFromName, isTextFile, fileKind, fileIcon } from './util.js';
 import { CATEGORIES, CATEGORY_ICONS, searchEmoji, EMOJI_LIST } from './emoji.js';
 import { mediaUrl } from './api.js';
-import { SERVER_ORIGIN, GIF_REPO_API } from './config.js';
-import { state, prefs, savePrefs, actions, avatarHtml, statusOf, STATUS_LABEL, bannerColor, getUser, chatName } from './store.js';
+import { loadGifs } from './gifs.js';
+import { state, prefs, savePrefs, actions, avatarHtml, nameHtml, badgesHtml, bannerStyle, themeStyle, statusOf, STATUS_LABEL, getUser, chatName } from './store.js';
 import { renderMarkdown, codeBlockHtml } from './markdown.js';
 import { parseZip, readZipEntry, buildTree } from './zip.js';
 
@@ -73,6 +73,29 @@ export function confirmDialog({ title, body = '', html = '', confirm = 'Confirm'
     m.el.querySelector('[data-act=no]').onclick = () => { done = true; m.close(); resolve(false); };
     m.el.querySelector('[data-act=yes]').onclick = () => { done = true; m.close(); resolve(true); };
     setTimeout(() => m.el.querySelector('[data-act=yes]').focus(), 40);
+  });
+}
+
+// Asks for one line of text. Resolves to the text, or null if cancelled.
+export function promptDialog({ title, body = '', label = '', confirm = 'OK', danger = false, optional = false }) {
+  return new Promise((resolve) => {
+    let done = false;
+    const m = openModal(`
+      <div class="modal-head"><h2>${esc(title)}</h2>${body ? `<p>${esc(body)}</p>` : ''}</div>
+      <form data-form>
+        <div class="modal-body"><label class="label" for="pd-input">${esc(label)}</label><input class="input" id="pd-input" maxlength="200" autocomplete="off" autofocus></div>
+        <div class="modal-foot"><button class="btn ghost" type="button" data-act="no">Cancel</button><button class="btn ${danger ? 'danger' : ''}" type="submit">${esc(confirm)}</button></div>
+      </form>`, { onClose: () => { if (!done) resolve(null); } });
+    const input = m.el.querySelector('#pd-input');
+    m.el.querySelector('[data-act=no]').onclick = () => { done = true; m.close(); resolve(null); };
+    m.el.querySelector('[data-form]').onsubmit = (e) => {
+      e.preventDefault();
+      const value = input.value.trim();
+      if (!value && !optional) { input.focus(); return; }
+      done = true;
+      m.close();
+      resolve(value);
+    };
   });
 }
 
@@ -255,28 +278,6 @@ export function emojiPicker(anchor, onPick, { placement = 'top-end', keepOpen = 
 }
 
 // ---------------- GIF picker ----------------
-let gifCache = null;
-async function loadGifs() {
-  if (gifCache) return gifCache;
-  try {
-    const res = await fetch(SERVER_ORIGIN + '/api/gifs');
-    if (res.ok) {
-      const data = await res.json();
-      if (data.gifs && data.gifs.length) return (gifCache = data.gifs);
-    }
-  } catch (e) {}
-  try {
-    const res = await fetch(GIF_REPO_API);
-    const data = await res.json();
-    gifCache = (Array.isArray(data) ? data : [])
-      .filter((f) => f && f.type === 'file' && /\.gif$/i.test(f.name) && typeof f.download_url === 'string')
-      .map((f) => ({ name: f.name, url: f.download_url }));
-  } catch (e) {
-    gifCache = [];
-  }
-  return gifCache;
-}
-
 export function gifPicker(anchor, onPick) {
   const pop = openPopover(anchor, `
     <div class="gp-top"><input class="input" placeholder="Search GIFs" autocomplete="off"></div>
@@ -288,7 +289,7 @@ export function gifPicker(anchor, onPick) {
     const q = input.value.trim().toLowerCase();
     const list = all.filter((g) => !q || g.name.toLowerCase().includes(q));
     grid.innerHTML = list.length
-      ? list.map((g) => `<button data-url="${esc(g.url)}" title="${esc(g.name.replace(/\.gif$/i, ''))}"><img src="${esc(mediaUrl(g.url))}" loading="lazy" alt=""></button>`).join('')
+      ? list.map((g) => `<button class="gif-tile" data-url="${esc(g.url)}" title="${esc(g.name.replace(/\.gif$/i, ''))}"><img src="${esc(mediaUrl(g.url))}" loading="lazy" decoding="async" alt=""></button>`).join('')
       : `<div class="empty">${all.length ? 'No GIFs match that.' : "No GIFs yet — add .gif files to the repo's /gifs folder."}</div>`;
   };
   loadGifs().then((g) => { all = g; if (pop.el.isConnected) render(); });
@@ -304,25 +305,28 @@ export function gifPicker(anchor, onPick) {
 }
 
 // ---------------- Profile popout ----------------
-export function profileCardHtml(user, { wide = false } = {}) {
+export function profileCardHtml(user, { preview = false } = {}) {
   const st = statusOf(user.id);
   const isMe = state.me && user.id === state.me.id;
   const mutual = !isMe ? Array.from(state.chats.values()).filter((c) => c.type === 'group' && Array.isArray(c.memberIds) && c.memberIds.includes(user.id)) : [];
-  return `
-    <div class="profile-banner" style="background:${esc(bannerColor(user))}">
-      <div class="pav">${avatarHtml(user, wide ? 80 : 80, { status: true })}</div>
+  const theme = themeStyle(user);
+  return `<div class="profile-wrap ${theme ? 'themed' : ''}"${theme ? ` style="${esc(theme)}"` : ''}>
+    <div class="profile-banner" style="${esc(bannerStyle(user))}">
+      <div class="pav">${avatarHtml(user, 80, { status: true })}</div>
     </div>
     <div class="profile-body">
-      <div class="profile-name">${esc(user.name)}</div>
+      <div class="profile-name">${nameHtml(user)}${badgesHtml(user)}</div>
+      ${user.username ? `<div class="profile-handle">@${esc(user.username)}</div>` : ''}
       <div class="profile-sub">${esc(st === 'offline' && user.lastSeen ? 'Last seen ' + ago(user.lastSeen) : STATUS_LABEL[st] || 'Offline')}</div>
       ${user.customStatus ? `<div style="margin-top:8px;color:var(--text);font-size:14px">${esc(user.customStatus)}</div>` : ''}
       ${user.bio ? `<div class="profile-card"><h4>About me</h4><div class="t">${renderMarkdown(user.bio, { userName: (id) => (getUser(id) || {}).name })}</div></div>` : ''}
       <div class="profile-card"><h4>Member since</h4><div class="t">${user.createdAt ? new Date(user.createdAt).toLocaleDateString([], { year: 'numeric', month: 'short', day: 'numeric' }) : 'The early days'}</div></div>
       ${mutual.length ? `<div class="profile-card"><h4>Private groups together — ${mutual.length}</h4><div class="t">${mutual.map((c) => esc(chatName(c))).join(', ')}</div></div>` : ''}
-      <div class="pp-actions">
+      ${preview ? '' : `<div class="pp-actions">
         ${isMe ? '<button class="btn sm block" data-pp="edit">Edit profile</button>' : `<button class="btn sm block" data-pp="dm">💬 Send message</button>`}
-      </div>
-    </div>`;
+        ${state.me && state.me.isAdmin ? `<button class="btn secondary sm" data-pp="admin" data-tip="Admin controls">🛡️</button>` : ''}
+      </div>`}
+    </div></div>`;
 }
 
 export function profilePopout(anchor, userId, placement = 'right-start') {
@@ -335,6 +339,7 @@ export function profilePopout(anchor, userId, placement = 'right-start') {
     pop.close();
     if (b.dataset.pp === 'dm') actions.openDM(userId);
     if (b.dataset.pp === 'edit') actions.openSettings('profile');
+    if (b.dataset.pp === 'admin') actions.openAdminUser(userId);
   });
   return pop;
 }
@@ -439,16 +444,16 @@ export async function openZipViewer(att) {
 }
 
 // ---------------- Member / user picker (used in group create + settings) ----------------
-export function memberPickerHtml(selected, { excludeMe = true } = {}) {
+export function memberPickerHtml(selected, { excludeMe = true, exclude = [] } = {}) {
   const users = Array.from(state.users.values())
-    .filter((u) => !(excludeMe && state.me && u.id === state.me.id))
+    .filter((u) => !(excludeMe && state.me && u.id === state.me.id) && !u.banned && !exclude.includes(u.id))
     .sort((a, b) => a.name.localeCompare(b.name));
   return `<input class="input" data-picker-search placeholder="Search people" autocomplete="off">
     <div class="picker-list scroller thin">${users.map((u) => `
       <label class="pick-row" data-name="${esc(u.name.toLowerCase())}">
         ${avatarHtml(u, 32, { status: true })}<span class="n">${esc(u.name)}</span>
         <input type="checkbox" value="${esc(u.id)}" ${selected.has(u.id) ? 'checked' : ''}>
-      </label>`).join('') || '<div class="side-empty">Nobody else has joined yet.</div>'}</div>`;
+      </label>`).join('') || `<div class="side-empty">${exclude.length ? "Everyone's already here." : 'Nobody else has joined yet.'}</div>`}</div>`;
 }
 
 export function wireMemberPicker(root, selected) {

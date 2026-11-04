@@ -21,7 +21,10 @@ export const state = {
   editingId: null,
   pending: [],           // attachments waiting to be sent
   maxUploadBytes: 50 * 1024 * 1024,
-  connected: false
+  connected: false,
+  server: { status: 'online', message: '' },
+  calls: new Map(),      // channelId -> { channelId, chatId, peers: [...] }
+  pushKey: null
 };
 
 // Filled in by app.js so other modules can trigger navigation etc. without
@@ -49,7 +52,12 @@ const PREF_DEFAULTS = {
   recentEmoji: [],
   notifBannerDismissed: false,
   memberList: true,
-  sendOnEnter: true
+  sendOnEnter: true,
+  pushEnabled: true,     // notifications with every tab closed
+  micId: '',
+  speakerId: '',
+  echoCancellation: true,
+  noiseSuppression: true
 };
 
 function loadPrefs() {
@@ -69,6 +77,7 @@ prefs24h.value = !!prefs.use24h;
 export function savePrefs() {
   try { localStorage.setItem('prefs', JSON.stringify(prefs)); } catch (e) {}
   prefs24h.value = !!prefs.use24h;
+  if (actions.onPrefsSaved) actions.onPrefsSaved();
 }
 
 export function applyAppearance() {
@@ -147,14 +156,14 @@ export function findChannel(channelId) {
 
 export function canManage(chat) {
   if (!chat || chat.type === 'dm' || !state.me) return false;
-  if (!chat.ownerId) return true;
+  if (!chat.ownerId || state.me.isAdmin) return true;
   return chat.ownerId === state.me.id;
 }
 
 export function chatMembers(chat) {
   if (!chat) return [];
-  if (Array.isArray(chat.memberIds)) return chat.memberIds.map((id) => state.users.get(id)).filter(Boolean);
-  return Array.from(state.users.values());
+  if (Array.isArray(chat.memberIds)) return chat.memberIds.map((id) => state.users.get(id)).filter((u) => u && !u.banned);
+  return Array.from(state.users.values()).filter((u) => !u.banned);
 }
 
 export function isChatMuted(chatId) {
@@ -183,8 +192,59 @@ export function avatarHtml(user, size = 40, opts = {}) {
     ? `<img src="${esc(src)}" alt="" loading="lazy" draggable="false">`
     : `<span class="av-fallback" style="background:${colorFor(user ? user.id : name)}">${esc(initials(name))}</span>`;
   const dot = opts.status ? `<i class="status-dot s-${statusOf(user && user.id)}"></i>` : '';
-  return `<span class="av" style="--av:${size}px"${user ? ` data-user="${esc(user.id)}"` : ''}>${inner}${dot}</span>`;
+  const look = (user && user.look) || {};
+  const ring = look.ring && look.ring !== 'none' && size >= 24 ? ` ring ring-${esc(look.ring)}` : '';
+  const ringColor = ring && look.ringColor ? `;--ring:${esc(look.ringColor)}` : '';
+  return `<span class="av${ring}" style="--av:${size}px${ringColor}"${user ? ` data-user="${esc(user.id)}"` : ''}>${inner}${dot}</span>`;
 }
+
+// A person's name with their chosen colour, effect and font.
+export function nameHtml(user) {
+  const look = (user && user.look) || {};
+  const cls = ['uname'];
+  let style = '';
+  if (look.nameColor) {
+    cls.push(look.nameColor2 ? 'gradient' : 'colored');
+    style = `--n1:${look.nameColor};--n2:${look.nameColor2 || look.nameColor}`;
+  }
+  if (look.nameFx && look.nameFx !== 'none') cls.push('fx-' + look.nameFx);
+  if (look.nameFont && look.nameFont !== 'default') cls.push('font-' + look.nameFont);
+  return `<span class="${esc(cls.join(' '))}"${style ? ` style="${esc(style)}"` : ''}>${esc(user ? user.name : 'Unknown')}</span>`;
+}
+
+// The little extras after a name: admin shield, staff tag, flair emoji.
+export function badgesHtml(user) {
+  if (!user) return '';
+  let html = '';
+  if (user.look && user.look.flair) html += `<span class="flair">${esc(user.look.flair)}</span>`;
+  if (user.role === 'admin') html += '<span class="badge-admin" title="Admin">🛡️</span>';
+  if (user.tag && user.tag.text) {
+    html += `<span class="user-tag"${user.tag.color ? ` style="--tag:${esc(user.tag.color)}"` : ''}>${esc(user.tag.text)}</span>`;
+  }
+  return html;
+}
+
+export function bannerStyle(user) {
+  const look = (user && user.look) || {};
+  const src = mediaUrl(look.banner);
+  if (src) return `background:center / cover no-repeat url("${src}")`;
+  if (look.bannerColor2) return `background:linear-gradient(135deg, ${bannerColor(user)}, ${look.bannerColor2})`;
+  return `background:${bannerColor(user)}`;
+}
+
+export function themeStyle(user) {
+  const look = (user && user.look) || {};
+  if (!look.themeA) return '';
+  return `--pa:${look.themeA};--pb:${look.themeB || look.themeA}`;
+}
+
+export const SERVER_STATUS = {
+  online: { icon: '🟢', label: 'All systems go', hint: 'Everything normal. No banner.' },
+  announcement: { icon: '📣', label: 'Announcement', hint: 'Shows your message in a banner for everyone.' },
+  degraded: { icon: '🟡', label: 'Having problems', hint: 'A warning banner. Everything still works.' },
+  readonly: { icon: '🔒', label: 'Read-only', hint: 'People can read but not post. Admins still can.' },
+  maintenance: { icon: '🛠️', label: 'Maintenance', hint: 'Locks everyone out with a holding screen. Admins stay in.' }
+};
 
 export function chatIconHtml(chat, size = 48) {
   if (chat.type === 'dm') return avatarHtml(dmOther(chat), size, { status: true });
