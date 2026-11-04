@@ -44,11 +44,16 @@ A private, Discord-style chat app. The frontend (`index.html` + `css/` + `js/`) 
 - Name color or gradient, name effects (glow, shimmer, rainbow, pulse), name fonts
 - Animated profile picture rings, emoji flair, banner image or gradient, profile theme colors
 
+**Accounts**
+- Sign up with an email, username and password. A 6-digit code goes to that inbox and expires in 10 minutes; the account is only created once it's entered
+- Log in with your username and password. **Forgot your password?** on the login screen emails a code to set a new one
+- Add or change your email in *Settings → My Account*
+
 **Admin** (*Settings → Admin → Become Admin*, needs the admin code)
 - Set the server status: all clear, announcement, having problems, read-only or maintenance
 - Set anyone's status (and lock it), rename them, give them a tag, make or remove admins
 - Time out, kick, ban or delete accounts, reset passwords
-- Make invites, delete groups, turn signups off, and see an audit log of what admins did
+- Delete groups, turn signups off, and see an audit log of what admins did
 
 **Notifications**
 - Desktop notifications that show up as **Windows** (or macOS/Linux) notifications. A banner asks you to click **Enable**; your browser then asks you to **Allow**
@@ -65,7 +70,7 @@ The browser itself has to be running to receive them. With every Chrome window c
 
 1. **Backend (self-hosted / Docker / Coolify):** `npm install` / `npm start` (Node 20+). Environment variables:
    - `ADMIN_CODE` — turns an account into an admin from *Settings → Admin*. If unset, one is generated and printed in the server log on every start.
-   - `SIGNUP_TOKEN` — lets people create accounts. Falls back to the old `SITE_KEY` if that's set. New accounts can also use an invite from the admin panel, or `ADMIN_CODE`.
+   - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM` — how sign-up codes get emailed, see below. Without these, codes are written to the server log instead.
    - `DATA_DIR` — a writable directory for `data.json` and `uploads/`. Point it at a mounted persistent volume (e.g. `/data`) so chats and files survive restarts/redeploys. Defaults to the app folder.
    - `MAX_UPLOAD_MB` — maximum size per uploaded file, default `50`. (If you run behind a reverse proxy with its own body-size limit, raise that too.)
    - `PORT` — defaults to `3000`.
@@ -75,6 +80,25 @@ The browser itself has to be running to receive them. With every Chrome window c
 3. **GIFs:** add `.gif` files to the `gifs/` folder — they appear in the GIF picker automatically.
 
 > **Upgrading:** deploy the new backend *and* frontend together; the new frontend needs the new API. On first start the server converts the old `data.json` automatically and keeps a backup (`data.v2-backup.json`). Nobody loses anything: people stay signed in on the browser they already use, and are asked to pick a username and password. Anyone who lost that browser needs an admin to use *Reset Password*, which can set a username too. Groups that were already open to everyone stay open until their owner makes them invite-only in *Group Settings → Members*.
+
+## Email on Coolify
+
+Sign-up codes go out over SMTP, so any email provider works. Add these to the Messages app in Coolify and redeploy:
+
+```
+SMTP_HOST=smtp.your-provider.com
+SMTP_PORT=587
+SMTP_USER=your-smtp-username
+SMTP_PASS=your-smtp-password
+SMTP_FROM=Messages <no-reply@your-domain.com>
+```
+
+- **Sending service (recommended):** Resend, Brevo, Mailgun or similar. They give you these values, and ask you to add a few DNS records for your domain. Those records are what keep the codes out of spam folders.
+- **Gmail, for a quick start:** host `smtp.gmail.com`, your Gmail address as the user, and an [app password](https://myaccount.google.com/apppasswords) as the password. Fine for a few friends, but not on your own domain.
+
+Port `465` also works; the connection type is picked from the port, and `SMTP_SECURE=true` or `false` overrides that. Some hosts block outgoing mail ports, so if sending times out, try the other port or ask your host.
+
+After deploying, use *Admin Panel → Overview → Send a test email*. If it fails, it shows you what the mail server said.
 
 ## Voice calls on Coolify
 
@@ -111,7 +135,9 @@ The admin panel's *Overview* shows whether a relay is set up. Calls are capped a
 
 ## Accounts & security notes
 
-- People log in with a **username and password**. Passwords are hashed with scrypt, and login attempts are rate-limited per address and per account. There's no email, so a forgotten password is reset by an admin.
-- **Creating an account needs a token.** Give people an invite or `SIGNUP_TOKEN`. `ADMIN_CODE` also works, but don't hand it out: anyone who has it can make themselves an admin.
+- People log in with a **username and password**. Passwords are hashed with scrypt, and login attempts are rate-limited per address and per account. A forgotten password is reset by email, or by an admin for accounts with no email on file. A reset signs out every other device and emails a notice.
+- **Anyone can sign up with an email they can prove they own.** Codes last 10 minutes, allow 5 wrong tries, and at most 5 are sent to an address per hour. Each email can only have one account. Admins can turn signups off in *Server Status*.
+- Emails are private: only the person and admins can see them.
+- Don't share `ADMIN_CODE`: anyone who has it can make themselves an admin.
 - Groups and DMs are only ever sent to their members, and that includes admins, who can see a group's name but not read it unless they're in it. Locked groups are only sent to people who've entered the password. This keeps casual eyes out; it isn't end-to-end encryption, and whoever runs the server can read everything in `data.json`. Voice call audio is encrypted between browsers and never touches the server (a TURN relay passes it along encrypted).
 - Uploaded files get long random URLs (like Discord attachments). Anyone who has a file's link can open it. Uploads are never run as web pages on the server (they're sandboxed or downloaded instead).

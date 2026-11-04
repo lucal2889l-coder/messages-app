@@ -1174,10 +1174,6 @@ body.compact .msg { gap: 10px; }
 .admin-row .ar-meta { flex: 1; min-width: 0; }
 .admin-row .ar-n { font-weight: 600; color: var(--strong); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .admin-row .ar-s { font-size: 12.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.invite-form { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 4px; }
-.invite-form .field { flex: 1; min-width: 160px; margin-bottom: 0; }
-.invite-form .field[style] { flex: 0 0 auto; min-width: 0; }
-.invite-code { font-family: var(--mono); font-size: 14px; background: var(--rail); padding: 2px 6px; border-radius: 4px; user-select: all; }
 .audit-row { padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 14px; display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: baseline; }
 .audit-row .ad { color: var(--muted); font-size: 13px; }
 .audit-row .at { margin-left: auto; color: var(--muted); font-size: 12px; }
@@ -1245,3 +1241,8 @@ body.compact .msg { gap: 10px; }
 .cz-preview { position: sticky; top: 20px; }
 .cz-preview .profile-pop { width: 100%; }
 @media (max-width: 1000px) { .cz-layout { grid-template-columns: minmax(0, 1fr); } .cz-preview { position: static; } }
+
+.code-input { text-align: center; font-size: 24px; letter-spacing: 8px; font-weight: 600; }
+.auth-timer { font-size: 13px; color: var(--muted); margin: -6px 0 8px; }
+.auth-alt button:disabled { color: var(--muted); cursor: default; }
+.check-row .btn { align-self: flex-start; margin-top: 6px; }

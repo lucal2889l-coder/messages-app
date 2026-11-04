@@ -161,6 +161,7 @@ function renderSettings(id, root, frame) {
         <div class="row">${avatarHtml(me, 80, { status: true })}<div class="n">${nameHtml(me)}${badgesHtml(me)}</div><button class="btn sm" data-go="profile">Edit User Profile</button></div>
         <div class="inner">
           <div class="kv"><div><div class="k">Display name</div><div class="v">${esc(me.name)}</div></div><button class="btn secondary sm" data-go="profile">Edit</button></div>
+          <div class="kv"><div><div class="k">Email</div><div class="v">${esc(me.email || 'Not added. Add one so you can reset your password.')}</div></div><button class="btn secondary sm" data-act="email">${me.email ? 'Change' : 'Add'}</button></div>
           <div class="kv"><div><div class="k">Username</div><div class="v">${esc(me.username || 'Not set yet')}</div></div><button class="btn secondary sm" data-act="${me.hasPassword ? 'username' : 'claim'}">${me.hasPassword ? 'Change' : 'Set up'}</button></div>
           <div class="kv"><div><div class="k">Status</div><div class="v">${esc(STATUS_LABEL[me.status] || 'Online')}</div></div><button class="btn secondary sm" data-act="status">Change</button></div>
           <div class="kv"><div><div class="k">Member since</div><div class="v">${esc(new Date(me.createdAt || Date.now()).toLocaleDateString())}</div></div></div>
@@ -203,6 +204,7 @@ function renderSettings(id, root, frame) {
       else if (act === 'status') actions.openStatusMenu(b, () => frame.redraw());
       else if (act === 'claim') openClaimDialog();
       else if (act === 'username') changeUsername(frame);
+      else if (act === 'email') changeEmail(frame);
       else if (act === 'others') {
         try { await api('POST', '/api/me/logout-others', {}); toast('Other devices were signed out', 'ok'); } catch (ex) { toast(ex.message, 'error'); }
       }
@@ -497,6 +499,45 @@ function renderSettings(id, root, frame) {
   }
 }
 
+function changeEmail(frame) {
+  const me = state.me;
+  const m = openModal(`
+    <div class="modal-head"><h2>${me.email ? 'Change your email' : 'Add your email'}</h2><p>It's used to reset your password. Only you and admins can see it.</p></div>
+    <form id="em-form">
+      <div class="modal-body" id="em-body">
+        <div class="field"><label class="label" for="em-new">Email</label><input class="input" id="em-new" type="email" maxlength="254" autocomplete="email" required autofocus></div>
+        ${me.hasPassword ? '<div class="field"><label class="label" for="em-pw">Current password</label><input class="input" id="em-pw" type="password" autocomplete="current-password" required></div>' : ''}
+        <div class="error" id="em-err"></div>
+      </div>
+      <div class="modal-foot"><button class="btn ghost" type="button" data-close>Cancel</button><button class="btn" type="submit" id="em-go">Send Code</button></div>
+    </form>`);
+  const form = $('#em-form', m.el);
+  const fail = (ex) => { $('#em-err', m.el).textContent = ex.message; };
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const pw = $('#em-pw', m.el);
+    try {
+      const pending = await api('POST', '/api/me/email/start', { email: $('#em-new', m.el).value.trim(), currentPassword: pw ? pw.value : undefined });
+      $('#em-body', m.el).innerHTML = `
+        <p style="margin:0 0 12px">${pending.delivered ? `We sent a 6-digit code to <b>${esc(pending.email)}</b>. It expires in 10 minutes.` : 'Email is not set up on this server yet, so the code went to the server log.'}</p>
+        <div class="field"><label class="label" for="em-code">Code</label><input class="input code-input" id="em-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" required></div>
+        <div class="error" id="em-err"></div>`;
+      $('#em-go', m.el).textContent = 'Confirm';
+      $('#em-code', m.el).focus();
+      form.onsubmit = async (ev) => {
+        ev.preventDefault();
+        try {
+          const res = await api('POST', '/api/me/email/verify', { id: pending.id, code: $('#em-code', m.el).value });
+          actions.setMe(res.user);
+          m.close();
+          toast('Email saved', 'ok');
+          frame.redraw();
+        } catch (ex) { fail(ex); }
+      };
+    } catch (ex) { fail(ex); }
+  };
+}
+
 function changeUsername(frame) {
   const m = openModal(`
     <div class="modal-head"><h2>Change your username</h2><p>You'll use it to log in.</p></div>
@@ -759,7 +800,7 @@ export function openNewDM() {
     const list = users.filter((u) => !q || u.name.toLowerCase().includes(q));
     $('#nd-list', m.el).innerHTML = list.length ? list.map((u) => `
       <div class="pick-row" data-u="${esc(u.id)}">${avatarHtml(u, 32, { status: true })}<span class="n">${esc(u.name)}<span style="display:block;font-size:12px;color:var(--muted);font-weight:400">${esc(u.customStatus || STATUS_LABEL[statusOf(u.id)])}</span></span><span class="btn sm">Message</span></div>`).join('')
-      : `<div class="side-empty">${users.length ? 'Nobody matches that name.' : 'Nobody else has joined yet. Ask an admin for an invite to send your friends!'}</div>`;
+      : `<div class="side-empty">${users.length ? 'Nobody matches that name.' : 'Nobody else has joined yet. Send your friends the link!'}</div>`;
   };
   draw();
   $('#nd-q', m.el).oninput = draw;

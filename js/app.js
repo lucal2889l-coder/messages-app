@@ -135,27 +135,34 @@ function showAuth(mode = 'login', note = '') {
     form.innerHTML = `
       <img class="auth-logo" src="icon.svg" alt="">
       <h1>Create an account</h1>
-      <p>You'll need a token from an admin.</p>
-      ${maintenance}
-      <div class="field"><label class="label" for="au-token">Admin token <span class="req">*</span></label><input class="input" id="au-token" autocomplete="off" spellcheck="false" required></div>
-      <div class="field"><label class="label" for="au-user">Username <span class="req">*</span></label><input class="input" id="au-user" maxlength="24" autocomplete="username" spellcheck="false" required></div>
-      <div class="field"><label class="label" for="au-name">Display name</label><input class="input" id="au-name" maxlength="32" autocomplete="nickname"></div>
+      <p>We'll email you a code to confirm it's you.</p>
+      ${noteHtml}${maintenance}
+      <div class="field"><label class="label" for="au-email">Email <span class="req">*</span></label><input class="input" id="au-email" type="email" maxlength="254" autocomplete="email" spellcheck="false" required value="${esc(signupDraft.email || '')}"></div>
+      <div class="field"><label class="label" for="au-user">Username <span class="req">*</span></label><input class="input" id="au-user" maxlength="24" autocomplete="username" spellcheck="false" required value="${esc(signupDraft.username || '')}"></div>
+      <div class="field"><label class="label" for="au-name">Display name</label><input class="input" id="au-name" maxlength="32" autocomplete="nickname" value="${esc(signupDraft.name || '')}"></div>
       <div class="field"><label class="label" for="au-pw">Password <span class="req">*</span></label><input class="input" id="au-pw" type="password" autocomplete="new-password" required></div>
       <div class="field"><label class="label" for="au-pw2">Confirm password <span class="req">*</span></label><input class="input" id="au-pw2" type="password" autocomplete="new-password" required></div>
       <div class="error" id="au-err"></div>
-      <button class="btn block" type="submit" id="au-go">Create Account</button>
+      <button class="btn block" type="submit" id="au-go">Send Code</button>
       <div class="auth-alt">Already have an account? <button type="button" id="au-switch">Log in</button></div>`;
-    $('#au-token').focus();
+    $('#au-email').focus();
     form.onsubmit = async (e) => {
       e.preventDefault();
       const err = $('#au-err');
       const password = $('#au-pw').value;
       if (password !== $('#au-pw2').value) { err.textContent = "Passwords don't match."; return; }
-      // Browsers from the very first version keep their old messages.
-      let legacy = null;
-      try { legacy = JSON.parse(LS.get('profile') || 'null'); } catch (ex) {}
-      const body = { token: $('#au-token').value.trim(), username: $('#au-user').value.trim(), name: $('#au-name').value.trim(), password, claimId: legacy && legacy.id };
-      await submitAuth('/api/auth/signup', body);
+      signupDraft = { email: $('#au-email').value.trim(), username: $('#au-user').value.trim(), name: $('#au-name').value.trim() };
+      const btn = $('#au-go');
+      btn.disabled = true;
+      btn.textContent = 'Sending…';
+      err.textContent = '';
+      try {
+        showVerify(await api('POST', '/api/auth/signup/start', Object.assign({ password }, signupDraft), { quiet: true }));
+      } catch (ex) {
+        err.textContent = ex.message;
+        btn.disabled = false;
+        btn.textContent = 'Send Code';
+      }
     };
   } else {
     form.innerHTML = `
@@ -167,6 +174,7 @@ function showAuth(mode = 'login', note = '') {
       <div class="field"><label class="label" for="au-pw">Password</label><input class="input" id="au-pw" type="password" autocomplete="current-password" required></div>
       <div class="error" id="au-err"></div>
       <button class="btn block" type="submit" id="au-go">Log In</button>
+      <div class="auth-alt"><button type="button" id="au-forgot">Forgot your password?</button></div>
       <div class="auth-alt">Need an account? <button type="button" id="au-switch">Create one</button></div>`;
     $('#au-user').focus();
     form.onsubmit = async (e) => {
@@ -175,6 +183,159 @@ function showAuth(mode = 'login', note = '') {
     };
   }
   $('#au-switch').onclick = () => showAuth(mode === 'signup' ? 'login' : 'signup');
+  const forgot = $('#au-forgot');
+  if (forgot) forgot.onclick = () => showForgot();
+}
+
+let signupDraft = {};
+
+async function finishAuth(res) {
+  signupDraft = {};
+  LS.set('auth_token', res.token);
+  LS.del('profile');
+  session.token = res.token;
+  await startApp();
+}
+
+// The countdown and resend button shared by the code screens.
+function wireCodeTimer(pending, resendPath, idKey, onGone) {
+  const resend = $('#au-resend');
+  const tick = () => {
+    if (!$('#au-timer')) { clearInterval(timer); return; }
+    const left = Math.max(0, pending.expiresAt - Date.now());
+    const wait = Math.ceil((pending.resendAt - Date.now()) / 1000);
+    const mins = Math.floor(left / 60000);
+    const secs = String(Math.floor(left / 1000) % 60).padStart(2, '0');
+    $('#au-timer').textContent = left ? `Code expires in ${mins}:${secs}` : 'This code has expired. Send a new one.';
+    resend.disabled = wait > 0;
+    resend.textContent = wait > 0 ? `Resend code (${wait}s)` : 'Resend code';
+  };
+  const timer = setInterval(tick, 1000);
+  tick();
+  resend.onclick = async () => {
+    $('#au-err').textContent = '';
+    try {
+      const res = await api('POST', resendPath, { [idKey]: pending[idKey] }, { quiet: true });
+      Object.assign(pending, res);
+      tick();
+      toast('New code sent', 'ok');
+      $('#au-code').value = '';
+      $('#au-code').focus();
+    } catch (e) {
+      if (e.status === 410) onGone(e.message);
+      else $('#au-err').textContent = e.message;
+    }
+  };
+}
+
+// Step two of signing up: the code from the email.
+function showVerify(pending) {
+  const form = $('#auth-form');
+  const where = pending.delivered
+    ? `We sent a 6-digit code to <b>${esc(pending.email)}</b>. Check your spam folder if you can't see it.`
+    : "Email isn't set up on this server yet, so the code went to the server log. Ask whoever runs it for your code.";
+  form.innerHTML = `
+    <img class="auth-logo" src="icon.svg" alt="">
+    <h1>Verify your email</h1>
+    <p>${where}</p>
+    <div class="field"><label class="label" for="au-code">Verification code</label><input class="input code-input" id="au-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" spellcheck="false" required></div>
+    <div class="auth-timer" id="au-timer"></div>
+    <div class="error" id="au-err"></div>
+    <button class="btn block" type="submit" id="au-go">Verify</button>
+    <div class="auth-alt"><button type="button" id="au-resend"></button> · <button type="button" id="au-back">Go back</button></div>`;
+  const input = $('#au-code');
+  input.focus();
+  wireCodeTimer(pending, '/api/auth/signup/resend', 'signupId', (msg) => showAuth('signup', msg));
+  input.oninput = () => {
+    input.value = input.value.replace(/\D/g, '');
+    if (input.value.length === 6) form.requestSubmit();
+  };
+  $('#au-back').onclick = () => showAuth('signup');
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const btn = $('#au-go');
+    if (btn.disabled) return;
+    btn.disabled = true;
+    $('#au-err').textContent = '';
+    try {
+      await finishAuth(await api('POST', '/api/auth/signup/verify', { signupId: pending.signupId, code: input.value }, { quiet: true }));
+    } catch (ex) {
+      if (ex.status === 410) { showAuth('signup', ex.message); return; }
+      $('#au-err').textContent = ex.message;
+      btn.disabled = false;
+      input.select();
+    }
+  };
+}
+
+// Forgot password, step one: which account?
+function showForgot(note = '') {
+  const form = $('#auth-form');
+  form.innerHTML = `
+    <img class="auth-logo" src="icon.svg" alt="">
+    <h1>Forgot your password?</h1>
+    <p>Enter the email on your account and we'll send you a code.</p>
+    ${note ? `<div class="auth-note bad">${esc(note)}</div>` : ''}
+    <div class="field"><label class="label" for="au-email">Email</label><input class="input" id="au-email" type="email" maxlength="254" autocomplete="email" spellcheck="false" required></div>
+    <div class="error" id="au-err"></div>
+    <button class="btn block" type="submit" id="au-go">Send Code</button>
+    <div class="auth-alt"><button type="button" id="au-back">Back to log in</button></div>`;
+  $('#au-email').focus();
+  $('#au-back').onclick = () => showAuth('login');
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const btn = $('#au-go');
+    const email = $('#au-email').value.trim();
+    btn.disabled = true;
+    $('#au-err').textContent = '';
+    try {
+      const res = await api('POST', '/api/auth/reset/start', { email }, { quiet: true });
+      showReset(Object.assign(res, { email }));
+    } catch (ex) {
+      $('#au-err').textContent = ex.message;
+      btn.disabled = false;
+    }
+  };
+}
+
+// Forgot password, step two: the code and a new password.
+function showReset(pending) {
+  const form = $('#auth-form');
+  const where = pending.delivered
+    ? `If <b>${esc(pending.email)}</b> has an account, a 6-digit code is on its way. Check your spam folder too. No email on your account? An admin can reset your password.`
+    : "Email isn't set up on this server yet, so ask whoever runs it to reset your password.";
+  form.innerHTML = `
+    <img class="auth-logo" src="icon.svg" alt="">
+    <h1>Choose a new password</h1>
+    <p>${where}</p>
+    <div class="field"><label class="label" for="au-code">Code</label><input class="input code-input" id="au-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" spellcheck="false" required></div>
+    <div class="auth-timer" id="au-timer"></div>
+    <div class="field"><label class="label" for="au-pw">New password</label><input class="input" id="au-pw" type="password" autocomplete="new-password" required></div>
+    <div class="field"><label class="label" for="au-pw2">Confirm new password</label><input class="input" id="au-pw2" type="password" autocomplete="new-password" required></div>
+    <div class="error" id="au-err"></div>
+    <button class="btn block" type="submit" id="au-go">Reset Password</button>
+    <div class="auth-alt"><button type="button" id="au-resend"></button> · <button type="button" id="au-back">Back to log in</button></div>`;
+  const input = $('#au-code');
+  input.focus();
+  input.oninput = () => { input.value = input.value.replace(/\D/g, ''); };
+  wireCodeTimer(pending, '/api/auth/reset/resend', 'resetId', showForgot);
+  $('#au-back').onclick = () => showAuth('login');
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const err = $('#au-err');
+    const password = $('#au-pw').value;
+    if (password !== $('#au-pw2').value) { err.textContent = "Passwords don't match."; return; }
+    const btn = $('#au-go');
+    btn.disabled = true;
+    err.textContent = '';
+    try {
+      await finishAuth(await api('POST', '/api/auth/reset/verify', { resetId: pending.resetId, code: input.value, password }, { quiet: true }));
+    } catch (ex) {
+      if (ex.status === 410) { showForgot(ex.message); return; }
+      err.textContent = ex.message;
+      btn.disabled = false;
+    }
+  };
 }
 
 async function submitAuth(path, body) {
@@ -182,11 +343,7 @@ async function submitAuth(path, body) {
   btn.disabled = true;
   $('#au-err').textContent = '';
   try {
-    const res = await api('POST', path, body, { quiet: true });
-    LS.set('auth_token', res.token);
-    LS.del('profile');
-    session.token = res.token;
-    await startApp();
+    await finishAuth(await api('POST', path, body, { quiet: true }));
   } catch (e) {
     $('#au-err').textContent = e.message;
     btn.disabled = false;
@@ -1008,7 +1165,7 @@ function drawPeople() {
   if (!users.length) {
     list.innerHTML = state.homeTab === 'online' && !q
       ? `<div class="empty-state"><div class="art">🌙</div><h3>It's quiet in here…</h3>Nobody else is online right now. Check the <a href="#" data-all>All</a> tab — you can message people even when they're offline.</div>`
-      : `<div class="empty-state"><div class="art">🔍</div><h3>No one found</h3>${state.users.size <= 1 ? 'Nobody else has joined yet. An admin can make invites for your friends!' : 'Try a different name.'}</div>`;
+      : `<div class="empty-state"><div class="art">🔍</div><h3>No one found</h3>${state.users.size <= 1 ? 'Nobody else has joined yet. Send your friends the link!' : 'Try a different name.'}</div>`;
     const a = list.querySelector('[data-all]');
     if (a) a.onclick = (e) => { e.preventDefault(); state.homeTab = 'all'; renderHeader(); drawPeople(); };
     return;
@@ -2504,7 +2661,7 @@ async function handleWs(msg) {
     }
     case 'kicked':
       LS.del('auth_token');
-      setAuthNote(msg.banned
+      setAuthNote(msg.plain ? msg.reason : msg.banned
         ? `This account was removed or banned${msg.reason ? ': ' + msg.reason : '.'}`
         : `You were signed out by an admin${msg.reason ? ': ' + msg.reason : '.'}`);
       location.reload();

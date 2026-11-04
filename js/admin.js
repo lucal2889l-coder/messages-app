@@ -48,7 +48,6 @@ export function openAdminPanel(section) {
     { id: 'server', label: 'Server Status' },
     { id: 'people', label: 'People' },
     { id: 'groups', label: 'Groups' },
-    { id: 'invites', label: 'Invites' },
     { id: 'audit', label: 'Audit Log' }
   ];
   return openFullscreen({ nav, initial: section || 'overview', title: 'Admin panel', render: renderSection });
@@ -63,7 +62,7 @@ async function renderSection(id, root, frame) {
     root.innerHTML = `<div class="empty-state">${esc(e.message)}</div>`;
     return;
   }
-  const sections = { overview: drawOverview, server: drawServer, people: drawPeople, groups: drawGroups, invites: drawInvites, audit: drawAudit };
+  const sections = { overview: drawOverview, server: drawServer, people: drawPeople, groups: drawGroups, audit: drawAudit };
   sections[id](root, data, frame);
 }
 
@@ -82,8 +81,17 @@ function drawOverview(root, d, frame) {
     </div>
     <h3>Setup</h3>
     <div class="check-row ${d.voice.relay ? 'ok' : ''}"><b>${d.voice.relay ? '✅' : '⚠️'} Voice relay (TURN)</b><span>${d.voice.relay ? 'Set up, so calls work on strict networks.' : 'Not set up. Calls work on most home networks, but can fail on school or office Wi-Fi. See the README.'}</span></div>
-    <div class="check-row ${d.signupTokenSet ? 'ok' : ''}"><b>${d.signupTokenSet ? '✅' : 'ℹ️'} Signup token</b><span>${d.signupTokenSet ? 'SIGNUP_TOKEN is set, so anyone you give it to can create an account.' : 'SIGNUP_TOKEN is not set. Make invites here for new people instead.'}</span></div>`;
+    <div class="check-row ${d.email.configured ? 'ok' : ''}"><b>${d.email.configured ? '✅' : '⚠️'} Email</b><span>${d.email.configured ? 'Set up, so sign-up codes get emailed.' : "Not set up. Sign-up codes go to the server log instead of people's inboxes. See the README."}</span>${d.email.configured ? '<button class="btn secondary xs" id="ad-mail">Send a test email</button>' : ''}</div>`;
   $('#ad-status', root).onclick = () => frame.show('server');
+  const mail = $('#ad-mail', root);
+  if (mail) mail.onclick = async () => {
+    const to = await promptDialog({ title: 'Send a test email', label: 'Send it to', confirm: 'Send' });
+    if (!to) return;
+    try {
+      await api('POST', '/api/admin/test-email', { to });
+      toast(`Test email sent to ${to}`, 'ok');
+    } catch (e) { toast(e.message, 'error'); }
+  };
 }
 
 function drawServer(root, d, frame) {
@@ -94,7 +102,7 @@ function drawServer(root, d, frame) {
       return `<label class="radio-card ${current.status === k ? 'selected' : ''}"><input type="radio" name="ad-st" value="${k}" ${current.status === k ? 'checked' : ''}><div><div class="t">${s.icon} ${esc(s.label)}</div><div class="d">${esc(s.hint)}</div></div></label>`;
     }).join('')}
     <div class="field" style="margin-top:14px"><label class="label" for="ad-msg">Message shown to everyone</label><textarea class="textarea" id="ad-msg" maxlength="300" placeholder="Back in 10 minutes!">${esc(current.message || '')}</textarea></div>
-    <div class="setting-row"><div><div class="t">Allow new accounts</div><div class="d">Turn off to stop signups, even with a valid token. The admin code still works.</div></div><label class="switch"><input type="checkbox" id="ad-signups" ${current.signupsOpen ? 'checked' : ''}><span></span></label></div>
+    <div class="setting-row"><div><div class="t">Allow new accounts</div><div class="d">Turn off to stop anyone new signing up.</div></div><label class="switch"><input type="checkbox" id="ad-signups" ${current.signupsOpen ? 'checked' : ''}><span></span></label></div>
     <div class="error" id="ad-err"></div>
     <button class="btn" id="ad-save" style="margin-top:8px">Update Status</button>`;
   $$('input[name=ad-st]', root).forEach((r) => r.onchange = () => {
@@ -127,7 +135,7 @@ function drawPeople(root, d, frame) {
   const draw = () => {
     const q = $('#ad-q', root).value.trim().toLowerCase();
     const users = d.users
-      .filter((u) => !q || u.name.toLowerCase().includes(q) || (u.username || '').toLowerCase().includes(q))
+      .filter((u) => !q || u.name.toLowerCase().includes(q) || (u.username || '').toLowerCase().includes(q) || (u.email || '').includes(q))
       .sort((a, b) => (b.role === 'admin') - (a.role === 'admin') || a.name.localeCompare(b.name));
     list.innerHTML = users.map((u) => `
       <div class="admin-row ${u.bannedInfo ? 'dim' : ''}" data-u="${esc(u.id)}">${avatarHtml(u, 36, { status: true })}
@@ -165,37 +173,6 @@ function drawGroups(root, d, frame) {
   };
 }
 
-function drawInvites(root, d, frame) {
-  root.innerHTML = `<h2>Invites</h2>
-    <div class="hint" style="margin:0 0 14px">People need a token to create an account. Make one here and send it to them. Don't give out the admin code: anyone with it can make themselves an admin.</div>
-    <div class="invite-form">
-      <div class="field"><label class="label" for="iv-note">Who's it for?</label><input class="input" id="iv-note" maxlength="60" placeholder="Sam"></div>
-      <div class="field" style="width:110px"><label class="label" for="iv-uses">Uses</label><input class="input" id="iv-uses" type="number" min="1" max="500" value="1"></div>
-      <button class="btn" id="iv-make">Create Invite</button>
-    </div>
-    <div class="error" id="iv-err"></div>
-    ${d.invites.map((i) => `
-      <div class="admin-row"><div class="ar-meta">
-        <div class="ar-n"><code class="invite-code">${esc(i.code)}</code></div>
-        <div class="ar-s">${i.note ? esc(i.note) + ' · ' : ''}${i.used} of ${i.uses} used · by ${esc(i.createdBy)}, ${esc(ago(i.createdAt))}</div>
-      </div><button class="btn secondary sm" data-copy="${esc(i.code)}">Copy</button><button class="btn ghost sm" data-rm="${esc(i.id)}">Revoke</button></div>`).join('') || '<div class="side-empty">No invites yet.</div>'}`;
-  $('#iv-make', root).onclick = async () => {
-    try {
-      const res = await api('POST', '/api/admin/invites', { note: $('#iv-note', root).value, uses: Number($('#iv-uses', root).value) || 1 });
-      if (await copyText(res.invite.code)) toast('Invite copied', 'ok');
-      frame.redraw();
-    } catch (e) { $('#iv-err', root).textContent = e.message; }
-  };
-  root.onclick = async (e) => {
-    const c = e.target.closest('[data-copy]');
-    if (c) { if (await copyText(c.dataset.copy)) toast('Invite copied', 'ok'); return; }
-    const r = e.target.closest('[data-rm]');
-    if (r) {
-      try { await api('DELETE', `/api/admin/invites/${r.dataset.rm}`); frame.redraw(); } catch (err) { toast(err.message, 'error'); }
-    }
-  };
-}
-
 function drawAudit(root, d) {
   root.innerHTML = `<h2>Audit Log</h2>
     <div class="hint" style="margin:0 0 12px">Everything admins have done, newest first.</div>
@@ -216,7 +193,7 @@ export async function openAdminUser(userId, onChange) {
   const statuses = ['online', 'idle', 'dnd', 'invisible'];
   const timeouts = [[0, 'No timeout'], [5, '5 minutes'], [60, '1 hour'], [1440, '1 day'], [10080, '1 week']];
   const m = openModal(`
-    <div class="modal-head"><h2>Manage ${esc(u.name)}</h2><p>${esc(u.username ? '@' + u.username : 'No login yet')} · ${u.sessions} signed-in device${u.sessions === 1 ? '' : 's'}</p><button class="icon-btn close" data-close aria-label="Close">✕</button></div>
+    <div class="modal-head"><h2>Manage ${esc(u.name)}</h2><p>${esc(u.username ? '@' + u.username : 'No login yet')}${u.email ? ' · ' + esc(u.email) : ''} · ${u.sessions} signed-in device${u.sessions === 1 ? '' : 's'}</p><button class="icon-btn close" data-close aria-label="Close">✕</button></div>
     <div class="modal-body">
       <label class="label">Status</label>
       <div class="status-pick">${statuses.map((s) => `<label class="status-opt"><input type="radio" name="au-st" value="${s}" ${u.status === s ? 'checked' : ''}><span class="status-ico s-${s}"></span>${esc(STATUS_LABEL[s])}</label>`).join('')}</div>

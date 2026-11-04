@@ -18,8 +18,7 @@
  *
  * Access model:
  *   - People log in with a username + password. Passwords are scrypt-hashed.
- *   - Creating an account needs a token: an invite made in the admin panel,
- *     SIGNUP_TOKEN (falls back to the old SITE_KEY), or ADMIN_CODE itself.
+ *   - Creating an account means proving an email address with a 6-digit code.
  *   - Each login gets its own session token, so one device can be signed out
  *     without touching the others. Sessions are what kick / ban revoke.
  *   - ADMIN_CODE turns an account into an admin from Settings -> Admin.
@@ -33,13 +32,11 @@ const http = require('http');
 const crypto = require('crypto');
 const { WebSocketServer, WebSocket } = require('ws');
 const webpush = require('web-push');
+const nodemailer = require('nodemailer');
 
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
-const LEGACY_DEFAULT_KEY = '123456789';
-const SIGNUP_TOKEN = process.env.SIGNUP_TOKEN ||
-  (process.env.SITE_KEY && process.env.SITE_KEY !== LEGACY_DEFAULT_KEY ? process.env.SITE_KEY : '');
 const PORT = process.env.PORT || 3000;
 // Point DATA_DIR at a persistent volume (e.g. /data on Coolify/Docker) so
 // chats survive restarts. Defaults to the app folder.
@@ -47,7 +44,7 @@ const DATA_DIR = process.env.DATA_DIR || __dirname;
 const DATA_FILE = path.join(DATA_DIR, 'data.json');
 const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
 const MAX_UPLOAD_BYTES = (Number(process.env.MAX_UPLOAD_MB) || 50) * 1024 * 1024;
-const API_VERSION = 3;
+const API_VERSION = 4;
 const DB_VERSION = 3;
 const MAX_CALL_PEERS = 8; // calls are peer-to-peer, so each person uploads to everyone else
 
@@ -64,11 +61,11 @@ const LIMITS = {
   fileName: 180,
   pageSize: 50,
   username: 24,
+  email: 254,
   password: 200,
   reason: 200,
   tag: 24,
-  serverMessage: 300,
-  inviteNote: 60
+  serverMessage: 300
 };
 
 const USER_STATUSES = ['online', 'idle', 'dnd', 'invisible'];
@@ -159,8 +156,24 @@ function isValidGif(v) {
 // ---------------------------------------------------------------------------
 // Persistence
 // ---------------------------------------------------------------------------
+// Email goes out over SMTP, so any provider works. Without it, codes go to the
+// server log so the person running it can still let someone in.
+const SMTP_PORT = Number(process.env.SMTP_PORT) || 587;
+const SMTP_FROM = process.env.SMTP_FROM || process.env.SMTP_USER || '';
+const mailer = process.env.SMTP_HOST
+  ? nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: SMTP_PORT,
+      secure: process.env.SMTP_SECURE ? process.env.SMTP_SECURE === 'true' : SMTP_PORT === 465,
+      auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS || '' } : undefined,
+      connectionTimeout: 10000,
+      greetingTimeout: 10000,
+      socketTimeout: 20000
+    })
+  : null;
+
 function emptyDb() {
-  return { version: DB_VERSION, users: {}, chats: {}, messages: {}, files: {}, settings: {}, invites: {}, push: {}, audit: [] };
+  return { version: DB_VERSION, users: {}, chats: {}, messages: {}, files: {}, settings: {}, push: {}, audit: [] };
 }
 
 // The original app stored everything as loose keys:
@@ -283,6 +296,7 @@ function normalizeUser(u) {
   }
   delete u.tokenHash;
   u.username = u.username || null;
+  u.email = u.email || null;
   u.passwordHash = u.passwordHash || null;
   u.role = u.role === 'admin' ? 'admin' : 'member';
   u.look = cleanLook(u.look);
@@ -293,6 +307,7 @@ function normalizeUser(u) {
 }
 
 Object.values(db.users).forEach(normalizeUser);
+delete db.invites; // from before anyone could sign up with just an email
 db.settings = db.settings || {};
 db.settings.server = Object.assign({ status: 'online', message: '', updatedAt: 0, signupsOpen: true }, db.settings.server);
 
@@ -336,12 +351,14 @@ function shutdown() {
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
-// token hash -> user id, lower-case username -> user id
+// token hash -> user id, lower-case username -> user id, email -> user id
 const tokenIndex = new Map();
 const usernameIndex = new Map();
+const emailIndex = new Map();
 Object.values(db.users).forEach((u) => {
   u.sessions.forEach((s) => tokenIndex.set(s.hash, u.id));
   if (u.username) usernameIndex.set(u.username.toLowerCase(), u.id);
+  if (u.email) emailIndex.set(u.email, u.id);
 });
 
 function startSession(user) {
@@ -780,54 +797,228 @@ function noteLoginFail(name) {
   else f.count++;
 }
 
-function findInvite(code) {
-  return Object.values(db.invites).find((i) => safeEqual(i.code, code) && i.used < i.uses) || null;
-}
+// Email sign-up: nothing is created until the code from the email comes back.
+// Pending sign-ups live in memory only, so a restart just means starting again.
+const SIGNUP_CODE_MS = 10 * 60 * 1000;
+const SIGNUP_PENDING_MS = 30 * 60 * 1000;
+const RESEND_WAIT_MS = 60 * 1000;
+const MAX_CODE_TRIES = 5;
+const MAX_EMAILS_PER_HOUR = 5;
+const EMAIL_RE = /^[^\s@"'<>(),;:\\]+@[^\s@"'<>(),;:\\]+\.[^\s@"'<>(),;:\\]{2,}$/;
 
-function validSignupToken(token) {
-  if (typeof token !== 'string' || !token) return false;
-  return safeEqual(token, ADMIN_CODE) || (!!SIGNUP_TOKEN && safeEqual(token, SIGNUP_TOKEN)) || !!findInvite(token);
-}
+const pendingSignups = new Map(); // id -> { id, email, username, name, passwordHash, codeHash, expiresAt, sentAt, tries, createdAt }
+const emailSends = new Map();     // address -> { count, resetAt }
 
-app.post('/api/auth/signup', rateLimit('signup', 10, 60000), async (req, res) => {
-  const b = req.body || {};
-  const token = typeof b.token === 'string' ? b.token.trim() : '';
-  if (!validSignupToken(token)) return res.status(403).json({ error: "That token isn't valid. Ask an admin for one." });
-  if (!db.settings.server.signupsOpen && !safeEqual(token, ADMIN_CODE)) {
-    return res.status(403).json({ error: 'New accounts are switched off right now.' });
+setInterval(() => {
+  const t = now();
+  pendingSignups.forEach((p, id) => { if (p.createdAt + SIGNUP_PENDING_MS < t) pendingSignups.delete(id); });
+  emailSends.forEach((e, key) => { if (e.resetAt < t) emailSends.delete(key); });
+}, 60000).unref();
+
+// Signing up is open, so this stops the form being used to flood someone's inbox.
+function takeEmailSend(email) {
+  const t = now();
+  const e = emailSends.get(email);
+  if (!e || e.resetAt < t) {
+    emailSends.set(email, { count: 1, resetAt: t + 3600000 });
+    return true;
   }
+  if (e.count >= MAX_EMAILS_PER_HOUR) return false;
+  e.count++;
+  return true;
+}
+
+const hashSignupCode = (p, code) => sha256(p.id + ':' + code);
+
+function freshSignupCode(p) {
+  const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+  Object.assign(p, { codeHash: hashSignupCode(p, code), expiresAt: now() + SIGNUP_CODE_MS, sentAt: now(), tries: 0 });
+  return code;
+}
+
+const CODE_EMAILS = {
+  signup: { title: 'Verify your email', intro: 'Enter this code in Messages to finish creating your account:', ignore: "If you didn't try to create an account, you can ignore this email." },
+  reset: { title: 'Reset your password', intro: 'Enter this code in Messages to choose a new password:', ignore: "If you didn't ask for this, you can ignore this email. Your password hasn't changed." },
+  email: { title: 'Confirm your email', intro: 'Enter this code in Messages to add this address to your account:', ignore: "If you didn't ask for this, you can ignore this email." }
+};
+
+async function sendCode(email, code, kind) {
+  if (!mailer) {
+    console.warn(`[email] SMTP_HOST is not set, so no email was sent. ${kind} code for ${email}: ${code}`);
+    return;
+  }
+  const c = CODE_EMAILS[kind];
+  await mailer.sendMail({
+    from: SMTP_FROM,
+    to: email,
+    subject: `Your Messages code is ${code}`,
+    text: `${c.intro} ${code}\n\nIt expires in 10 minutes. ${c.ignore}`,
+    html: `<div style="font-family:system-ui,sans-serif;max-width:420px;margin:0 auto;padding:24px;color:#222">
+      <h2 style="margin:0 0 12px">${c.title}</h2>
+      <p style="margin:0 0 16px">${c.intro}</p>
+      <div style="font-size:32px;font-weight:700;letter-spacing:6px;background:#f2f3f5;border-radius:8px;padding:14px;text-align:center">${code}</div>
+      <p style="margin:16px 0 0;color:#666;font-size:14px">It expires in 10 minutes. ${c.ignore}</p>
+    </div>`
+  });
+}
+
+function signupView(p) {
+  return { signupId: p.id, email: p.email, expiresAt: p.expiresAt, resendAt: p.sentAt + RESEND_WAIT_MS, delivered: !!mailer };
+}
+
+app.post('/api/auth/signup/start', rateLimit('signup', 10, 60000), async (req, res) => {
+  if (!db.settings.server.signupsOpen) return res.status(403).json({ error: 'New accounts are switched off right now.' });
+  const b = req.body || {};
+  const email = cleanOneLine(b.email, LIMITS.email + 1).toLowerCase();
+  if (email.length > LIMITS.email || !EMAIL_RE.test(email)) return res.status(400).json({ error: "That doesn't look like an email address." });
+  if (emailIndex.has(email)) return res.status(400).json({ error: 'That email already has an account. Try logging in.' });
   const username = cleanOneLine(b.username, LIMITS.username + 1);
   const name = cleanOneLine(b.name, LIMITS.name) || username;
   const uErr = usernameError(username);
   if (uErr) return res.status(400).json({ error: uErr });
   const pErr = passwordError(b.password);
   if (pErr) return res.status(400).json({ error: pErr });
-  const passwordHash = await hashPassword(b.password);
-  // The hash takes a moment; check the username and invite again in case someone got there first.
-  if (usernameIndex.has(username.toLowerCase())) return res.status(400).json({ error: 'That username is taken.' });
-  const invite = findInvite(token);
-  if (!validSignupToken(token)) return res.status(403).json({ error: "That token isn't valid. Ask an admin for one." });
+  const earlier = Array.from(pendingSignups.values()).find((p) => p.email === email);
+  if (earlier && earlier.sentAt + RESEND_WAIT_MS > now()) {
+    return res.status(429).json({ error: 'We just sent a code to that address. Wait a minute before trying again.' });
+  }
+  if (!takeEmailSend(email)) return res.status(429).json({ error: 'Too many codes sent to that address. Try again in an hour.' });
+  const p = { id: crypto.randomBytes(16).toString('hex'), email, username, name, passwordHash: await hashPassword(b.password), createdAt: now() };
+  const code = freshSignupCode(p);
+  try {
+    await sendCode(email, code, 'signup');
+  } catch (e) {
+    console.error('[email] could not send a sign-up code:', e.message);
+    return res.status(502).json({ error: "We couldn't send the email. Check the address, or try again in a bit." });
+  }
+  if (earlier) pendingSignups.delete(earlier.id);
+  pendingSignups.set(p.id, p);
+  res.json(signupView(p));
+});
 
-  // Browsers from the very first version of the app stored a random id; let them
-  // claim it (once) so their old messages stay theirs.
-  let user = null;
-  if (isValidId(b.claimId) && db.users[b.claimId] && !db.users[b.claimId].passwordHash && !db.users[b.claimId].sessions.length) {
-    user = db.users[b.claimId];
-    user.name = name;
+app.post('/api/auth/signup/resend', rateLimit('signup-resend', 10, 60000), async (req, res) => {
+  const p = pendingSignups.get(req.body && req.body.signupId);
+  if (!p) return res.status(410).json({ error: 'That sign-up has run out. Please start again.' });
+  if (p.sentAt + RESEND_WAIT_MS > now()) return res.status(429).json({ error: 'Wait a moment before asking for another code.' });
+  if (!takeEmailSend(p.email)) return res.status(429).json({ error: 'Too many codes sent to that address. Try again in an hour.' });
+  const code = freshSignupCode(p);
+  try {
+    await sendCode(p.email, code, 'signup');
+  } catch (e) {
+    console.error('[email] could not send a sign-up code:', e.message);
+    return res.status(502).json({ error: "We couldn't send the email. Try again in a bit." });
   }
-  if (!user) {
-    user = { id: isValidId(b.claimId) && !db.users[b.claimId] ? b.claimId : newId(), name, avatar: null, bio: '', customStatus: '', status: 'online', accent: null, createdAt: now(), reads: {} };
-    normalizeUser(user);
-    db.users[user.id] = user;
+  res.json(signupView(p));
+});
+
+app.post('/api/auth/signup/verify', rateLimit('signup-verify', 30, 60000), (req, res) => {
+  const b = req.body || {};
+  const p = pendingSignups.get(b.signupId);
+  if (!p) return res.status(410).json({ error: 'That sign-up has run out. Please start again.' });
+  if (p.expiresAt < now()) return res.status(400).json({ error: 'That code has expired. Send yourself a new one.', expired: true });
+  const code = String(b.code || '').replace(/\D/g, '');
+  if (!safeEqual(hashSignupCode(p, code), p.codeHash)) {
+    p.tries++;
+    if (p.tries >= MAX_CODE_TRIES) {
+      pendingSignups.delete(p.id);
+      return res.status(410).json({ error: 'Too many wrong codes. Please start again.' });
+    }
+    return res.status(400).json({ error: "That code isn't right." });
   }
-  setUsername(user, username);
-  user.passwordHash = passwordHash;
+  pendingSignups.delete(p.id);
+  // Someone else could have got there during the wait.
+  if (!db.settings.server.signupsOpen) return res.status(403).json({ error: 'New accounts are switched off right now.' });
+  if (emailIndex.has(p.email)) return res.status(410).json({ error: 'That email already has an account. Try logging in.' });
+  if (usernameIndex.has(p.username.toLowerCase())) return res.status(410).json({ error: 'That username was just taken. Please start again with a different one.' });
+
+  const user = { id: newId(), name: p.name, avatar: null, bio: '', customStatus: '', status: 'online', accent: null, createdAt: now(), reads: {} };
+  normalizeUser(user);
+  db.users[user.id] = user;
+  setUsername(user, p.username);
+  user.email = p.email;
+  emailIndex.set(p.email, user.id);
+  user.passwordHash = p.passwordHash;
   user.lastSeen = now();
-  if (invite) invite.used++;
   const sessionToken = startSession(user);
   scheduleSave();
   broadcast({ type: 'user:update', user: publicUser(user) });
   res.json({ token: sessionToken, user: meView(user) });
+});
+
+// Forgot password. The answer never depends on whether the email has an account:
+// the email goes out in the background so even the timing gives nothing away,
+// and an unknown address gets a pending reset whose code nobody ever receives.
+const pendingResets = new Map(); // id -> { id, email, userId, codeHash, expiresAt, sentAt, tries, createdAt }
+
+setInterval(() => {
+  const t = now();
+  pendingResets.forEach((p, id) => { if (p.createdAt + SIGNUP_PENDING_MS < t) pendingResets.delete(id); });
+}, 60000).unref();
+
+function resetView(p) {
+  return { resetId: p.id, expiresAt: p.expiresAt, resendAt: p.sentAt + RESEND_WAIT_MS, delivered: !!mailer };
+}
+
+function mailResetCode(p, code) {
+  if (!p.userId) return;
+  sendCode(p.email, code, 'reset').catch((e) => console.error('[email] could not send a reset code:', e.message));
+}
+
+app.post('/api/auth/reset/start', rateLimit('reset', 10, 60000), (req, res) => {
+  const email = cleanOneLine(req.body && req.body.email, LIMITS.email + 1).toLowerCase();
+  if (email.length > LIMITS.email || !EMAIL_RE.test(email)) return res.status(400).json({ error: "That doesn't look like an email address." });
+  const earlier = Array.from(pendingResets.values()).find((p) => p.email === email);
+  if (earlier && earlier.sentAt + RESEND_WAIT_MS > now()) {
+    return res.status(429).json({ error: 'We just sent a code. Wait a minute before trying again.' });
+  }
+  if (!takeEmailSend(email)) return res.status(429).json({ error: 'Too many codes sent to that address. Try again in an hour.' });
+  const user = db.users[emailIndex.get(email)];
+  const p = { id: crypto.randomBytes(16).toString('hex'), email, userId: user && !user.banned ? user.id : null, createdAt: now() };
+  const code = freshSignupCode(p);
+  if (earlier) pendingResets.delete(earlier.id);
+  pendingResets.set(p.id, p);
+  mailResetCode(p, code);
+  res.json(resetView(p));
+});
+
+app.post('/api/auth/reset/resend', rateLimit('reset-resend', 10, 60000), (req, res) => {
+  const p = pendingResets.get(req.body && req.body.resetId);
+  if (!p) return res.status(410).json({ error: 'That reset has run out. Please start again.' });
+  if (p.sentAt + RESEND_WAIT_MS > now()) return res.status(429).json({ error: 'Wait a moment before asking for another code.' });
+  if (!takeEmailSend(p.email)) return res.status(429).json({ error: 'Too many codes sent to that address. Try again in an hour.' });
+  mailResetCode(p, freshSignupCode(p));
+  res.json(resetView(p));
+});
+
+app.post('/api/auth/reset/verify', rateLimit('reset-verify', 30, 60000), async (req, res) => {
+  const b = req.body || {};
+  const p = pendingResets.get(b.resetId);
+  if (!p) return res.status(410).json({ error: 'That reset has run out. Please start again.' });
+  if (p.expiresAt < now()) return res.status(400).json({ error: 'That code has expired. Send yourself a new one.', expired: true });
+  if (!safeEqual(hashSignupCode(p, String(b.code || '').replace(/\D/g, '')), p.codeHash)) {
+    p.tries++;
+    if (p.tries >= MAX_CODE_TRIES) {
+      pendingResets.delete(p.id);
+      return res.status(410).json({ error: 'Too many wrong codes. Please start again.' });
+    }
+    return res.status(400).json({ error: "That code isn't right." });
+  }
+  const pErr = passwordError(b.password);
+  if (pErr) return res.status(400).json({ error: pErr });
+  pendingResets.delete(p.id);
+  const user = db.users[p.userId];
+  if (!user || user.banned) return res.status(410).json({ error: 'That reset has run out. Please start again.' });
+  user.passwordHash = await hashPassword(b.password);
+  revokeSessions(user);
+  dropSockets(user, 'Your password was changed. Log in again to continue.', false, true);
+  loginFails.delete((user.username || '').toLowerCase());
+  const token = startSession(user);
+  scheduleSave();
+  if (mailer) {
+    mailer.sendMail({ from: SMTP_FROM, to: user.email, subject: 'Your Messages password was changed', text: "Your Messages password was just changed. If this wasn't you, ask an admin to lock your account." })
+      .catch((e) => console.error('[email] could not send a password notice:', e.message));
+  }
+  res.json({ token, user: meView(user) });
 });
 
 app.post('/api/auth/login', rateLimit('login', 20, 60000), async (req, res) => {
@@ -858,6 +1049,7 @@ app.post('/api/auth/logout', requireUser, (req, res) => {
 function meView(u) {
   return Object.assign(publicUser(u), {
     status: u.status || 'online',
+    email: u.email || null,
     reads: u.reads || {},
     hasPassword: !!u.passwordHash,
     isAdmin: isAdmin(u),
@@ -933,6 +1125,66 @@ app.post('/api/me/credentials', rateLimit('credentials', 10, 60000), authed, asy
   }
   scheduleSave();
   broadcast({ type: 'user:update', user: publicUser(u) });
+  res.json({ user: meView(u) });
+});
+
+// Add or change the email on an account, proving the new address with a code.
+const pendingEmails = new Map(); // id -> { id, email, userId, codeHash, expiresAt, sentAt, tries, createdAt }
+
+setInterval(() => {
+  const t = now();
+  pendingEmails.forEach((p, id) => { if (p.createdAt + SIGNUP_PENDING_MS < t) pendingEmails.delete(id); });
+}, 60000).unref();
+
+app.post('/api/me/email/start', rateLimit('email-change', 6, 60000), authed, async (req, res) => {
+  const u = req.user;
+  const b = req.body || {};
+  if (u.passwordHash && !(typeof b.currentPassword === 'string' && await verifyPassword(b.currentPassword, u.passwordHash))) {
+    return res.status(403).json({ error: 'Your current password is wrong.' });
+  }
+  const email = cleanOneLine(b.email, LIMITS.email + 1).toLowerCase();
+  if (email.length > LIMITS.email || !EMAIL_RE.test(email)) return res.status(400).json({ error: "That doesn't look like an email address." });
+  if (email === u.email) return res.status(400).json({ error: "That's already your email." });
+  if (emailIndex.has(email)) return res.status(400).json({ error: 'That email already has an account.' });
+  const earlier = Array.from(pendingEmails.values()).find((p) => p.userId === u.id);
+  if (earlier && earlier.email === email && earlier.sentAt + RESEND_WAIT_MS > now()) {
+    return res.status(429).json({ error: 'We just sent a code. Wait a minute before trying again.' });
+  }
+  if (!takeEmailSend(email)) return res.status(429).json({ error: 'Too many codes sent to that address. Try again in an hour.' });
+  const p = { id: crypto.randomBytes(16).toString('hex'), email, userId: u.id, createdAt: now() };
+  const code = freshSignupCode(p);
+  try {
+    await sendCode(email, code, 'email');
+  } catch (e) {
+    console.error('[email] could not send a confirmation code:', e.message);
+    return res.status(502).json({ error: "We couldn't send the email. Check the address, or try again in a bit." });
+  }
+  if (earlier) pendingEmails.delete(earlier.id);
+  pendingEmails.set(p.id, p);
+  res.json({ id: p.id, email, expiresAt: p.expiresAt, delivered: !!mailer });
+});
+
+app.post('/api/me/email/verify', rateLimit('email-change-verify', 30, 60000), authed, (req, res) => {
+  const b = req.body || {};
+  const p = pendingEmails.get(b.id);
+  if (!p || p.userId !== req.user.id) return res.status(410).json({ error: 'That code has run out. Please start again.' });
+  if (p.expiresAt < now()) return res.status(410).json({ error: 'That code has expired. Please start again.' });
+  if (!safeEqual(hashSignupCode(p, String(b.code || '').replace(/\D/g, '')), p.codeHash)) {
+    p.tries++;
+    if (p.tries >= MAX_CODE_TRIES) {
+      pendingEmails.delete(p.id);
+      return res.status(410).json({ error: 'Too many wrong codes. Please start again.' });
+    }
+    return res.status(400).json({ error: "That code isn't right." });
+  }
+  pendingEmails.delete(p.id);
+  if (emailIndex.has(p.email)) return res.status(410).json({ error: 'That email already has an account.' });
+  const u = req.user;
+  if (u.email) emailIndex.delete(u.email);
+  u.email = p.email;
+  emailIndex.set(p.email, u.id);
+  scheduleSave();
+  notifyMe(u);
   res.json({ user: meView(u) });
 });
 
@@ -1642,6 +1894,7 @@ function audit(actor, action, detail) {
 function adminUserView(u) {
   return Object.assign(publicUser(u), {
     status: u.status || 'online',
+    email: u.email || null,
     statusLocked: !!u.statusLocked,
     timeoutUntil: u.timeoutUntil || 0,
     bannedInfo: u.banned || null,
@@ -1690,7 +1943,6 @@ app.get('/api/admin/overview', adminOnly, (req, res) => {
     server: serverView(),
     users: Object.values(db.users).map(adminUserView),
     groups,
-    invites: Object.values(db.invites).sort((a, b) => b.createdAt - a.createdAt),
     audit: db.audit.slice().reverse(),
     stats: {
       users: Object.keys(db.users).length,
@@ -1703,7 +1955,7 @@ app.get('/api/admin/overview', adminOnly, (req, res) => {
       pushDevices: Object.keys(db.push).length
     },
     voice: { relay: !!process.env.TURN_URLS },
-    signupTokenSet: !!SIGNUP_TOKEN
+    email: { configured: !!mailer }
   });
 });
 
@@ -1734,8 +1986,8 @@ function targetOther(req, res) {
   return u;
 }
 
-function dropSockets(user, reason, banned) {
-  const data = JSON.stringify({ type: 'kicked', reason: reason || '', banned: !!banned });
+function dropSockets(user, reason, banned, plain) {
+  const data = JSON.stringify({ type: 'kicked', reason: reason || '', banned: !!banned, plain: !!plain });
   clients.forEach((meta, ws) => {
     if (meta.userId !== user.id) return;
     send(ws, data);
@@ -1816,7 +2068,7 @@ app.post('/api/admin/users/:userId/unban', adminOnly, (req, res) => {
   res.json({ user: adminUserView(u) });
 });
 
-// No email in this app, so a forgotten password is fixed by an admin. Also how an
+// For people with no email on their account, an admin fixes a forgotten password. Also how an
 // old account that lost its browser token gets a login again.
 app.post('/api/admin/users/:userId/reset-password', adminOnly, async (req, res) => {
   const u = adminTarget(req, res);
@@ -1843,6 +2095,7 @@ app.delete('/api/admin/users/:userId', adminOnly, (req, res) => {
   revokeSessions(u);
   dropSockets(u, 'Your account was deleted.', true);
   if (u.username) usernameIndex.delete(u.username.toLowerCase());
+  if (u.email) emailIndex.delete(u.email);
   Object.keys(db.push).forEach((id) => { if (db.push[id].userId === u.id) delete db.push[id]; });
   Object.values(db.chats).forEach((c) => {
     if (c.type === 'group' && Array.isArray(c.memberIds) && c.memberIds.includes(u.id)) {
@@ -1865,25 +2118,16 @@ app.delete('/api/admin/chats/:chatId', adminOnly, (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/admin/invites', adminOnly, (req, res) => {
-  const b = req.body || {};
-  const invite = {
-    id: newId(),
-    code: crypto.randomBytes(6).toString('hex'),
-    note: cleanOneLine(b.note, LIMITS.inviteNote),
-    uses: Math.max(1, Math.min(500, Math.floor(Number(b.uses)) || 1)),
-    used: 0,
-    createdBy: req.user.name,
-    createdAt: now()
-  };
-  db.invites[invite.id] = invite;
-  audit(req.user, 'made an invite', invite.note);
-  res.json({ invite });
-});
-
-app.delete('/api/admin/invites/:id', adminOnly, (req, res) => {
-  if (db.invites[req.params.id]) { delete db.invites[req.params.id]; audit(req.user, 'revoked an invite'); }
-  res.json({ ok: true });
+app.post('/api/admin/test-email', rateLimit('test-email', 6, 60000), adminOnly, async (req, res) => {
+  const to = cleanOneLine(req.body && req.body.to, LIMITS.email + 1);
+  if (!EMAIL_RE.test(to)) return res.status(400).json({ error: "That doesn't look like an email address." });
+  if (!mailer) return res.status(400).json({ error: 'Email is not set up yet: SMTP_HOST is missing.' });
+  try {
+    await mailer.sendMail({ from: SMTP_FROM, to, subject: 'Messages test email', text: 'Email from Messages is working.' });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(502).json({ error: 'The mail server said: ' + e.message });
+  }
 });
 
 app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
@@ -2146,5 +2390,5 @@ wss.on('close', () => clearInterval(heartbeat));
 
 server.listen(PORT, () => {
   console.log(`Messages server listening on port ${PORT} (data: ${DATA_FILE})`);
-  if (!SIGNUP_TOKEN) console.warn('[admin] SIGNUP_TOKEN is not set. New accounts need ADMIN_CODE or an invite from the admin panel.');
+  if (!mailer) console.warn('[email] SMTP_HOST is not set. Sign-up codes will be written to this log instead of emailed.');
 });
